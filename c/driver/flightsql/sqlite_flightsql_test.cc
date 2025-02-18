@@ -20,7 +20,7 @@
 #include <random>
 #include <thread>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest-matchers.h>
 #include <gtest/gtest-param-test.h>
@@ -121,6 +121,7 @@ class SqliteFlightSqlQuirks : public adbc_validation::DriverQuirks {
   bool supports_get_objects() const override { return true; }
   bool supports_partitioned_data() const override { return true; }
   bool supports_dynamic_parameter_binding() const override { return true; }
+  std::string catalog() const override { return "main"; }
 };
 
 class SqliteFlightSqlTest : public ::testing::Test, public adbc_validation::DatabaseTest {
@@ -234,18 +235,20 @@ TEST_F(SqliteFlightSqlTest, TestGarbageInput) {
   ASSERT_THAT(AdbcDatabaseRelease(&database, &error), IsOkStatus(&error));
 }
 
-TEST_F(SqliteFlightSqlTest, AdbcDriverBackwardsCompatibility) {
-  // XXX: sketchy cast
-  auto* driver = static_cast<struct AdbcDriver*>(malloc(ADBC_DRIVER_1_0_0_SIZE));
-  std::memset(driver, 0, ADBC_DRIVER_1_0_0_SIZE);
+int Canary(const struct AdbcError*) { return 0; }
 
-  ASSERT_THAT(::FlightSQLDriverInit(ADBC_VERSION_1_0_0, driver, &error),
+TEST_F(SqliteFlightSqlTest, AdbcDriverBackwardsCompatibility) {
+  struct AdbcDriver driver;
+  std::memset(&driver, 0, ADBC_DRIVER_1_1_0_SIZE);
+  driver.ErrorGetDetailCount = Canary;
+
+  ASSERT_THAT(::FlightSQLDriverInit(ADBC_VERSION_1_0_0, &driver, &error),
               IsOkStatus(&error));
 
-  ASSERT_THAT(::FlightSQLDriverInit(424242, driver, &error),
-              adbc_validation::IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
+  ASSERT_EQ(Canary, driver.ErrorGetDetailCount);
 
-  free(driver);
+  ASSERT_THAT(::FlightSQLDriverInit(424242, &driver, &error),
+              adbc_validation::IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
 }
 
 class SqliteFlightSqlConnectionTest : public ::testing::Test,
@@ -311,7 +314,13 @@ TEST_F(SqliteFlightSqlStatementTest, CancelError) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement.value, &error),
               IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, "SELECT 1", &error),
+  // Use a query that generates a lot of rows so that it won't complete before we cancel
+  // Can't insert newlines since the server stuffs the query into a header without
+  // sanitizing
+  auto query =
+      "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<5000) "
+      "SELECT c1.x, c2.x FROM c c1, c c2";
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query, &error),
               IsOkStatus(&error));
 
   adbc_validation::StreamReader reader;

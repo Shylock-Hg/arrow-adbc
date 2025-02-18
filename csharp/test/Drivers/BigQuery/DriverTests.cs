@@ -18,10 +18,12 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Apache.Arrow.Adbc.Drivers.BigQuery;
 using Apache.Arrow.Adbc.Tests.Metadata;
 using Apache.Arrow.Adbc.Tests.Xunit;
 using Apache.Arrow.Ipc;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
 {
@@ -36,12 +38,14 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
     public class DriverTests
     {
         BigQueryTestConfiguration _testConfiguration;
+        readonly ITestOutputHelper? outputHelper;
 
-        public DriverTests()
+        public DriverTests(ITestOutputHelper? outputHelper)
         {
+            this.outputHelper = outputHelper;
+
             Skip.IfNot(Utils.CanExecuteTestConfig(BigQueryTestingUtils.BIGQUERY_TEST_CONFIG_VARIABLE));
             _testConfiguration = Utils.LoadTestConfiguration<BigQueryTestConfiguration>(BigQueryTestingUtils.BIGQUERY_TEST_CONFIG_VARIABLE);
-
         }
 
         /// <summary>
@@ -87,7 +91,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
 
             for (int i = 0; i < infoNameArray.Length; i++)
             {
-                AdbcInfoCode value = (AdbcInfoCode)infoNameArray.GetValue(i);
+                AdbcInfoCode value = (AdbcInfoCode)infoNameArray.GetValue(i)!.Value;
                 DenseUnionArray valueArray = (DenseUnionArray)recordBatch.Column("info_value");
 
                 Assert.Contains(value.ToString(), expectedValues);
@@ -101,13 +105,39 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
         /// Validates if the driver can call GetObjects.
         /// </summary>
         [SkippableFact, Order(3)]
+        public void CanGetObjectsAllCatalogs()
+        {
+            AdbcConnection adbcConnection = BigQueryTestingUtils.GetBigQueryAdbcConnection(_testConfiguration);
+
+            IArrowArrayStream stream = adbcConnection.GetObjects(
+                    depth: AdbcConnection.GetObjectsDepth.Catalogs,
+                    catalogPattern: null,
+                    dbSchemaPattern: null,
+                    tableNamePattern: null,
+                    tableTypes: BigQueryTableTypes.TableTypes,
+                    columnNamePattern: null);
+
+            RecordBatch recordBatch = stream.ReadNextRecordBatchAsync().Result;
+
+            List<AdbcCatalog> catalogs = GetObjectsParser.ParseCatalog(recordBatch, null);
+
+            foreach (AdbcCatalog ct in catalogs)
+            {
+                this.outputHelper?.WriteLine(ct.Name);
+            }
+        }
+
+        /// <summary>
+        /// Validates if the driver can call GetObjects.
+        /// </summary>
+        [SkippableFact, Order(3)]
         public void CanGetObjects()
         {
             // need to add the database
-            string catalogName = _testConfiguration.Metadata.Catalog;
-            string schemaName = _testConfiguration.Metadata.Schema;
-            string tableName = _testConfiguration.Metadata.Table;
-            string columnName = null;
+            string? catalogName = _testConfiguration.Metadata.Catalog;
+            string? schemaName = _testConfiguration.Metadata.Schema;
+            string? tableName = _testConfiguration.Metadata.Table;
+            string? columnName = null;
 
             AdbcConnection adbcConnection = BigQueryTestingUtils.GetBigQueryAdbcConnection(_testConfiguration);
 
@@ -116,22 +146,56 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
                     catalogPattern: catalogName,
                     dbSchemaPattern: schemaName,
                     tableNamePattern: tableName,
-                    tableTypes: new List<string> { "BASE TABLE", "VIEW" },
+                    tableTypes: BigQueryTableTypes.TableTypes,
                     columnNamePattern: columnName);
 
             RecordBatch recordBatch = stream.ReadNextRecordBatchAsync().Result;
 
-            List<AdbcCatalog> catalogs = GetObjectsParser.ParseCatalog(recordBatch, catalogName, schemaName);
+            List<AdbcCatalog> catalogs = GetObjectsParser.ParseCatalog(recordBatch, schemaName);
 
-            List<AdbcColumn> columns = catalogs
+            List<AdbcColumn>? columns = catalogs
                 .Select(s => s.DbSchemas)
                 .FirstOrDefault()
-                .Select(t => t.Tables)
+                ?.Select(t => t.Tables)
                 .FirstOrDefault()
-                .Select(c => c.Columns)
+                ?.Select(c => c.Columns)
                 .FirstOrDefault();
 
-            Assert.Equal(_testConfiguration.Metadata.ExpectedColumnCount, columns.Count);
+            Assert.Equal(_testConfiguration.Metadata.ExpectedColumnCount, columns?.Count);
+        }
+
+        [SkippableFact, Order(3)]
+        public void CanGetObjectsTables()
+        {
+            string? catalogName = _testConfiguration.Metadata.Catalog;
+            string? schemaName = _testConfiguration.Metadata.Schema;
+            string? tableName = _testConfiguration.Metadata.Table;
+
+            AdbcConnection adbcConnection = BigQueryTestingUtils.GetBigQueryAdbcConnection(_testConfiguration);
+
+            IArrowArrayStream stream = adbcConnection.GetObjects(
+                    depth: AdbcConnection.GetObjectsDepth.Tables,
+                    catalogPattern: catalogName,
+                    dbSchemaPattern: schemaName,
+                    tableNamePattern: null,
+                    tableTypes: BigQueryTableTypes.TableTypes,
+                    columnNamePattern: null);
+
+            RecordBatch recordBatch = stream.ReadNextRecordBatchAsync().Result;
+
+            List<AdbcCatalog> catalogs = GetObjectsParser.ParseCatalog(recordBatch, schemaName);
+
+            List<AdbcTable>? tables = catalogs
+                .Where(c => string.Equals(c.Name, catalogName))
+                .Select(c => c.DbSchemas)
+                .FirstOrDefault()
+                ?.Where(s => string.Equals(s.Name, schemaName))
+                .Select(s => s.Tables)
+                .FirstOrDefault();
+
+            AdbcTable? table = tables?.Where((table) => string.Equals(table.Name, tableName)).FirstOrDefault();
+            Assert.True(table != null, "table should not be null");
+            Assert.Equal("BASE TABLE", table.Type);
         }
 
         /// <summary>
@@ -142,8 +206,8 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
         {
             AdbcConnection adbcConnection = BigQueryTestingUtils.GetBigQueryAdbcConnection(_testConfiguration);
 
-            string catalogName = _testConfiguration.Metadata.Catalog;
-            string schemaName = _testConfiguration.Metadata.Schema;
+            string? catalogName = _testConfiguration.Metadata.Catalog;
+            string? schemaName = _testConfiguration.Metadata.Schema;
             string tableName = _testConfiguration.Metadata.Table;
 
             Schema schema = adbcConnection.GetTableSchema(catalogName, schemaName, tableName);
@@ -167,10 +231,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
 
             StringArray stringArray = (StringArray)recordBatch.Column("table_type");
 
-            List<string> known_types = new List<string>
-            {
-                "BASE TABLE", "VIEW"
-            };
+            List<string> known_types = BigQueryTableTypes.TableTypes.ToList();
 
             int results = 0;
 

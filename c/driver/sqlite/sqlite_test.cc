@@ -21,7 +21,7 @@
 #include <string>
 #include <string_view>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest-matchers.h>
 #include <gtest/gtest-param-test.h>
@@ -79,10 +79,16 @@ class SqliteQuirks : public adbc_validation::DriverQuirks {
       case NANOARROW_TYPE_UINT32:
       case NANOARROW_TYPE_UINT64:
         return NANOARROW_TYPE_INT64;
+      case NANOARROW_TYPE_HALF_FLOAT:
       case NANOARROW_TYPE_FLOAT:
-      case NANOARROW_TYPE_DOUBLE:
         return NANOARROW_TYPE_DOUBLE;
       case NANOARROW_TYPE_LARGE_STRING:
+      case NANOARROW_TYPE_STRING_VIEW:
+        return NANOARROW_TYPE_STRING;
+      case NANOARROW_TYPE_LARGE_BINARY:
+      case NANOARROW_TYPE_FIXED_SIZE_BINARY:
+      case NANOARROW_TYPE_BINARY_VIEW:
+        return NANOARROW_TYPE_BINARY;
       case NANOARROW_TYPE_DATE32:
       case NANOARROW_TYPE_TIMESTAMP:
         return NANOARROW_TYPE_STRING;
@@ -132,14 +138,13 @@ class SqliteQuirks : public adbc_validation::DriverQuirks {
     return ddl;
   }
 
-  bool supports_bulk_ingest(const char* mode) const override {
-    return std::strcmp(mode, ADBC_INGEST_OPTION_MODE_APPEND) == 0 ||
-           std::strcmp(mode, ADBC_INGEST_OPTION_MODE_CREATE) == 0;
-  }
+  bool supports_bulk_ingest(const char* mode) const override { return true; }
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_temporary() const override { return true; }
   bool supports_concurrent_statements() const override { return true; }
-  bool supports_get_option() const override { return false; }
+  bool supports_metadata_current_catalog() const override { return true; }
+  bool supports_metadata_current_db_schema() const override { return false; }
+  bool supports_get_option() const override { return true; }
   std::optional<adbc_validation::SqlInfoValue> supports_get_sql_info(
       uint32_t info_code) const override {
     switch (info_code) {
@@ -184,6 +189,10 @@ class SqliteConnectionTest : public ::testing::Test,
 ADBCV_TEST_CONNECTION(SqliteConnectionTest)
 
 TEST_F(SqliteConnectionTest, ExtensionLoading) {
+#if defined(ADBC_SQLITE_WITH_NO_LOAD_EXTENSION)
+  GTEST_SKIP() << "Linking to SQLite without extension loading";
+#endif
+
   ASSERT_THAT(AdbcConnectionNew(&connection, &error),
               adbc_validation::IsOkStatus(&error));
 
@@ -325,6 +334,12 @@ class SqliteStatementTest : public ::testing::Test,
   void TestSqlIngestInterval() {
     GTEST_SKIP() << "Cannot ingest Interval (not implemented)";
   }
+  void TestSqlIngestListOfInt32() {
+    GTEST_SKIP() << "Cannot ingest list<int32> (not implemented)";
+  }
+  void TestSqlIngestListOfString() {
+    GTEST_SKIP() << "Cannot ingest list<string> (not implemented)";
+  }
 
  protected:
   void ValidateIngestedTemporalData(struct ArrowArrayView* values, ArrowType type,
@@ -436,8 +451,11 @@ class SqliteReaderTest : public ::testing::Test {
   }
 
   void Bind(struct ArrowArray* batch, struct ArrowSchema* schema) {
-    ASSERT_THAT(AdbcSqliteBinderSetArray(&binder, batch, schema, &error),
-                IsOkStatus(&error));
+    Handle<struct ArrowArrayStream> stream;
+    struct ArrowArray batch_internal = *batch;
+    batch->release = nullptr;
+    adbc_validation::MakeStream(&stream.value, schema, {batch_internal});
+    ASSERT_NO_FATAL_FAILURE(Bind(&stream.value));
   }
 
   void Bind(struct ArrowArrayStream* stream) {

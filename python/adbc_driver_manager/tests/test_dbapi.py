@@ -17,6 +17,7 @@
 
 import pandas
 import pyarrow
+import pyarrow.dataset
 import pytest
 from pandas.testing import assert_frame_equal
 
@@ -109,7 +110,7 @@ def test_get_objects(sqlite):
     assert metadata[0]["catalog_name"] == "main"
     schemas = metadata[0]["catalog_db_schemas"]
     assert len(schemas) == 1
-    assert schemas[0]["db_schema_name"] is None
+    assert schemas[0]["db_schema_name"] == ""
     tables = schemas[0]["db_schema_tables"]
     assert len(tables) == 1
     assert tables[0]["table_name"] == "temporary"
@@ -349,6 +350,15 @@ def test_fetch_empty(sqlite):
         cur.execute("CREATE TABLE foo (bar)")
         cur.execute("SELECT * FROM foo")
         assert cur.fetchall() == []
+
+
+@pytest.mark.sqlite
+def test_reader(sqlite, tmp_path) -> None:
+    # Regression test for https://github.com/apache/arrow-adbc/issues/1523
+    with sqlite.cursor() as cur:
+        cur.execute("SELECT 1")
+        reader = cur.fetch_record_batch()
+        pyarrow.dataset.write_dataset(reader, tmp_path, format="parquet")
 
 
 @pytest.mark.sqlite

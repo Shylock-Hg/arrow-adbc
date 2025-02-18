@@ -101,6 +101,22 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
         }
 
         [SkippableFact]
+        public void VerifySchemaTablesWithNoConstraints()
+        {
+            using (Adbc.Client.AdbcConnection adbcConnection = GetAdbcConnection(includeTableConstraints: false))
+            {
+                adbcConnection.Open();
+
+                string schema = "Tables";
+
+                var tables = adbcConnection.GetSchema(schema);
+
+                Assert.True(tables.Rows.Count > 0, $"No tables were found in the schema '{schema}'");
+            }
+        }
+
+
+        [SkippableFact]
         public void VerifySchemaTables()
         {
             using (Adbc.Client.AdbcConnection adbcConnection = GetAdbcConnection())
@@ -117,7 +133,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
 
                 var catalogs = adbcConnection.GetSchema("Catalogs");
                 Assert.Single(catalogs.Columns);
-                var catalog = (string)catalogs.Rows[0].ItemArray[0];
+                var catalog = (string?)catalogs.Rows[0].ItemArray[0];
 
                 catalogs = adbcConnection.GetSchema("Catalogs", new[] { catalog });
                 Assert.Equal(1, catalogs.Rows.Count);
@@ -129,7 +145,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
 
                 var schemas = adbcConnection.GetSchema("Schemas", new[] { catalog });
                 Assert.Equal(2, schemas.Columns.Count);
-                var schema = (string)schemas.Rows[0].ItemArray[1];
+                var schema = (string?)schemas.Rows[0].ItemArray[1];
 
                 schemas = adbcConnection.GetSchema("Schemas", new[] { catalog, schema });
                 Assert.Equal(1, schemas.Rows.Count);
@@ -166,12 +182,14 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
             }
         }
 
-        private Adbc.Client.AdbcConnection GetAdbcConnection()
+        private Adbc.Client.AdbcConnection GetAdbcConnection(bool includeTableConstraints = true)
         {
+            _testConfiguration.IncludeTableConstraints = includeTableConstraints;
+
             return new Adbc.Client.AdbcConnection(
                 new BigQueryDriver(),
                 BigQueryTestingUtils.GetBigQueryParameters(_testConfiguration),
-                new Dictionary<string,string>()
+                new Dictionary<string, string>()
             );
         }
     }
