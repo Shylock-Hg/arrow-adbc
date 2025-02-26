@@ -19,18 +19,21 @@ package snowflake
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/snowflakedb/gosnowflake"
 )
 
 const (
+	OptionStatementQueryTag                = "adbc.snowflake.statement.query_tag"
 	OptionStatementQueueSize               = "adbc.rpc.result_queue_size"
 	OptionStatementPrefetchConcurrency     = "adbc.snowflake.rpc.prefetch_concurrency"
 	OptionStatementIngestWriterConcurrency = "adbc.snowflake.statement.ingest_writer_concurrency"
@@ -42,7 +45,7 @@ const (
 )
 
 type statement struct {
-	cnxn                *cnxn
+	cnxn                *connectionImpl
 	alloc               memory.Allocator
 	queueSize           int
 	prefetchConcurrency int
@@ -52,9 +55,18 @@ type statement struct {
 	targetTable   string
 	ingestMode    string
 	ingestOptions *ingestOptions
+	queryTag      string
 
 	bound      arrow.Record
 	streamBind array.RecordReader
+}
+
+// setQueryContext applies the query tag if present.
+func (st *statement) setQueryContext(ctx context.Context) context.Context {
+	if st.queryTag != "" {
+		ctx = gosnowflake.WithQueryTag(ctx, st.queryTag)
+	}
+	return ctx
 }
 
 // Close releases any relevant resources associated with this statement
@@ -80,6 +92,10 @@ func (st *statement) Close() error {
 }
 
 func (st *statement) GetOption(key string) (string, error) {
+	switch key {
+	case OptionStatementQueryTag:
+		return st.queryTag, nil
+	}
 	return "", adbc.Error{
 		Msg:  fmt.Sprintf("[Snowflake] Unknown statement option '%s'", key),
 		Code: adbc.StatusNotFound,
@@ -184,6 +200,9 @@ func (st *statement) SetOption(key string, val string) error {
 			}
 		}
 		return st.SetOptionInt(key, int64(size))
+	case OptionStatementQueryTag:
+		st.queryTag = val
+		return nil
 	case OptionUseHighPrecision:
 		switch val {
 		case adbc.OptionValueEnabled:
@@ -319,9 +338,9 @@ func toSnowflakeType(dt arrow.DataType) string {
 	case arrow.DECIMAL, arrow.DECIMAL256:
 		dec := dt.(arrow.DecimalType)
 		return fmt.Sprintf("NUMERIC(%d,%d)", dec.GetPrecision(), dec.GetScale())
-	case arrow.STRING, arrow.LARGE_STRING:
+	case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
 		return "text"
-	case arrow.BINARY, arrow.LARGE_BINARY:
+	case arrow.BINARY, arrow.LARGE_BINARY, arrow.BINARY_VIEW:
 		return "binary"
 	case arrow.FIXED_SIZE_BINARY:
 		fsb := dt.(*arrow.FixedSizeBinaryType)
@@ -361,7 +380,7 @@ func (st *statement) initIngest(ctx context.Context) error {
 	if st.ingestMode == adbc.OptionValueIngestModeCreateAppend {
 		createBldr.WriteString(" IF NOT EXISTS ")
 	}
-	createBldr.WriteString(st.targetTable)
+	createBldr.WriteString(quoteTblName(st.targetTable))
 	createBldr.WriteString(" (")
 
 	var schema *arrow.Schema
@@ -376,7 +395,7 @@ func (st *statement) initIngest(ctx context.Context) error {
 			createBldr.WriteString(", ")
 		}
 
-		createBldr.WriteString(strconv.Quote(f.Name))
+		createBldr.WriteString(quoteTblName(f.Name))
 		createBldr.WriteString(" ")
 		ty := toSnowflakeType(f.Type)
 		if ty == "" {
@@ -398,7 +417,7 @@ func (st *statement) initIngest(ctx context.Context) error {
 	case adbc.OptionValueIngestModeAppend:
 		// Do nothing
 	case adbc.OptionValueIngestModeReplace:
-		replaceQuery := "DROP TABLE IF EXISTS " + st.targetTable
+		replaceQuery := "DROP TABLE IF EXISTS " + quoteTblName(st.targetTable)
 		_, err := st.cnxn.cn.ExecContext(ctx, replaceQuery, nil)
 		if err != nil {
 			return errToAdbcErr(adbc.StatusInternal, err)
@@ -447,6 +466,8 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 //
 // This invalidates any prior result sets on this statement.
 func (st *statement) ExecuteQuery(ctx context.Context) (array.RecordReader, int64, error) {
+	ctx = st.setQueryContext(ctx)
+
 	if st.targetTable != "" {
 		n, err := st.executeIngest(ctx)
 		return nil, n, err
@@ -463,10 +484,26 @@ func (st *statement) ExecuteQuery(ctx context.Context) (array.RecordReader, int6
 	// concatenate RecordReaders which doesn't exist yet. let's put
 	// that off for now.
 	if st.streamBind != nil || st.bound != nil {
-		return nil, -1, adbc.Error{
-			Msg:  "executing non-bulk ingest with bound params not yet implemented",
-			Code: adbc.StatusNotImplemented,
+		bind := snowflakeBindReader{
+			doQuery: func(params []driver.NamedValue) (array.RecordReader, error) {
+				loader, err := st.cnxn.cn.QueryArrowStream(ctx, st.query, params...)
+				if err != nil {
+					return nil, errToAdbcErr(adbc.StatusInternal, err)
+				}
+				return newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision)
+			},
+			currentBatch: st.bound,
+			stream:       st.streamBind,
 		}
+		st.bound = nil
+		st.streamBind = nil
+
+		rdr := concatReader{}
+		err := rdr.Init(&bind)
+		if err != nil {
+			return nil, -1, err
+		}
+		return &rdr, -1, nil
 	}
 
 	loader, err := st.cnxn.cn.QueryArrowStream(ctx, st.query)
@@ -482,6 +519,8 @@ func (st *statement) ExecuteQuery(ctx context.Context) (array.RecordReader, int6
 // ExecuteUpdate executes a statement that does not generate a result
 // set. It returns the number of rows affected if known, otherwise -1.
 func (st *statement) ExecuteUpdate(ctx context.Context) (int64, error) {
+	ctx = st.setQueryContext(ctx)
+
 	if st.targetTable != "" {
 		return st.executeIngest(ctx)
 	}
@@ -491,6 +530,38 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (int64, error) {
 			Msg:  "cannot execute without a query",
 			Code: adbc.StatusInvalidState,
 		}
+	}
+
+	if st.streamBind != nil || st.bound != nil {
+		numRows := int64(0)
+		bind := snowflakeBindReader{
+			currentBatch: st.bound,
+			stream:       st.streamBind,
+		}
+		st.bound = nil
+		st.streamBind = nil
+
+		defer bind.Release()
+		for {
+			params, err := bind.NextParams()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				return -1, err
+			}
+
+			r, err := st.cnxn.cn.ExecContext(ctx, st.query, params)
+			if err != nil {
+				return -1, errToAdbcErr(adbc.StatusInternal, err)
+			}
+			n, err := r.RowsAffected()
+			if err != nil {
+				numRows = -1
+			} else if numRows >= 0 {
+				numRows += n
+			}
+		}
+		return numRows, nil
 	}
 
 	r, err := st.cnxn.cn.ExecContext(ctx, st.query, nil)
@@ -508,6 +579,8 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (int64, error) {
 
 // ExecuteSchema gets the schema of the result set of a query without executing it.
 func (st *statement) ExecuteSchema(ctx context.Context) (*arrow.Schema, error) {
+	ctx = st.setQueryContext(ctx)
+
 	if st.targetTable != "" {
 		return nil, adbc.Error{
 			Msg:  "cannot execute schema for ingestion",

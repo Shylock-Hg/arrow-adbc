@@ -23,6 +23,7 @@ license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.9"
 dynamic = ["version"]
+dependencies = ["typing-extensions"]
 
 [project.optional-dependencies]
 dbapi = ["pandas", "pyarrow>=8.0.0"]
@@ -42,6 +43,7 @@ markers = [
     "panicdummy: tests that require the testing-only panicdummy driver",
     "sqlite: tests that require the SQLite driver",
 ]
+xfail_strict = true
 
 [tool.setuptools]
 license-files = ["LICENSE.txt", "NOTICE.txt"]

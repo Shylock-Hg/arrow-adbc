@@ -19,12 +19,18 @@
 set -e
 
 : ${BUILD_ALL:=1}
+: ${BUILD_DRIVER_BIGQUERY:=${BUILD_ALL}}
 : ${BUILD_DRIVER_FLIGHTSQL:=${BUILD_ALL}}
 : ${BUILD_DRIVER_MANAGER:=${BUILD_ALL}}
 : ${BUILD_DRIVER_POSTGRESQL:=${BUILD_ALL}}
 : ${BUILD_DRIVER_SQLITE:=${BUILD_ALL}}
 : ${BUILD_DRIVER_SNOWFLAKE:=${BUILD_ALL}}
 
+: ${ADBC_USE_ASAN:=ON}
+: ${ADBC_USE_UBSAN:=ON}
+
+: ${ADBC_CMAKE_ARGS:=""}
+: ${CMAKE_BUILD_TYPE:=Debug}
 
 main() {
     local -r source_dir="${1}"
@@ -32,7 +38,13 @@ main() {
 
     set -x
 
-    cmake -S "${source_dir}/c" -B ${build_dir} \
+    cmake -S "${source_dir}/c" \
+          -B ${build_dir} \
+          ${ADBC_CMAKE_ARGS} \
+          -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+          -DADBC_USE_ASAN="${ADBC_USE_ASAN}" \
+          -DADBC_USE_UBSAN="${ADBC_USE_UBSAN}" \
+          -DADBC_DRIVER_BIGQUERY=${BUILD_DRIVER_MANAGER} \
           -DADBC_DRIVER_MANAGER=${BUILD_DRIVER_MANAGER} \
           -DADBC_DRIVER_FLIGHTSQL=${BUILD_DRIVER_FLIGHTSQL} \
           -DADBC_DRIVER_POSTGRESQL=${BUILD_DRIVER_POSTGRESQL} \

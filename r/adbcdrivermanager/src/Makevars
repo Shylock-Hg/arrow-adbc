@@ -15,4 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-PKG_CPPFLAGS=-I../src -DADBC_EXPORT=""
+CXX_STD = CXX17
+PKG_CPPFLAGS=-I../src/c/include -I../src/c -DADBC_EXPORT=""
+
+OBJECTS = driver_test.o \
+    error.o \
+    init.o \
+    options.o \
+    radbc.o \
+    utils.o \
+    c/driver_manager/adbc_driver_manager.o

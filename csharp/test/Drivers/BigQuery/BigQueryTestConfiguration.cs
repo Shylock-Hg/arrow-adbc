@@ -24,23 +24,46 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
     /// </summary>
     internal class BigQueryTestConfiguration : TestConfiguration
     {
+        public BigQueryTestConfiguration()
+        {
+            AllowLargeResults = false;
+            IncludeTableConstraints = true;
+        }
+
         [JsonPropertyName("projectId")]
-        public string ProjectId { get; set; }
+        public string? ProjectId { get; set; }
 
         [JsonPropertyName("clientId")]
-        public string ClientId { get; set; }
+        public string ClientId { get; set; } = string.Empty;
 
         [JsonPropertyName("clientSecret")]
-        public string ClientSecret { get; set; }
+        public string ClientSecret { get; set; } = string.Empty;
 
         [JsonPropertyName("refreshToken")]
-        public string RefreshToken { get; set; }
+        public string RefreshToken { get; set; } = string.Empty;
 
         [JsonPropertyName("scopes")]
-        public string Scopes { get; set; }
+        public string Scopes { get; set; } = string.Empty;
 
         [JsonPropertyName("jsonCredential")]
-        public string JsonCredential { get; set; }
+        public string JsonCredential { get; set; } = string.Empty;
 
+        [JsonPropertyName("allowLargeResults")]
+        public bool AllowLargeResults { get; set; }
+
+        [JsonPropertyName("largeResultsDestinationTable")]
+        public string LargeResultsDestinationTable { get; set; } = string.Empty;
+
+        [JsonPropertyName("includeTableConstraints")]
+        public bool IncludeTableConstraints { get; set; }
+
+        [JsonPropertyName("includePublicProjectId")]
+        public bool IncludePublicProjectId { get; set; } = false;
+
+        [JsonPropertyName("timeoutMinutes")]
+        public int? TimeoutMinutes { get; set; }
+
+        [JsonPropertyName("maxStreamCount")]
+        public int? MaxStreamCount { get; set; }
     }
 }

@@ -16,15 +16,19 @@
 */
 
 using System.IO;
-using Apache.Arrow.Adbc.C;
 
 namespace Apache.Arrow.Adbc.Drivers.Interop.Snowflake
 {
     /// <summary>
     /// Lightweight class for loading the Snowflake Go driver to .NET.
     /// </summary>
-    public class SnowflakeDriverLoader
+    public class SnowflakeDriverLoader : AdbcDriverLoader
     {
+        public SnowflakeDriverLoader() : base("libadbc_driver_snowflake", "SnowflakeDriverInit")
+        {
+
+        }
+
         /// <summary>
         /// Loads the Snowflake Go driver from the current directory using the default name and entry point.
         /// </summary>
@@ -32,32 +36,7 @@ namespace Apache.Arrow.Adbc.Drivers.Interop.Snowflake
         /// <exception cref="FileNotFoundException"></exception>
         public static AdbcDriver LoadDriver()
         {
-            string file = "libadbc_driver_snowflake.dll";
-
-            if(File.Exists(file))
-            {
-                // get the full path because some .NET versions need it
-                file = Path.GetFullPath(file);
-            }
-            else
-            {
-                throw new FileNotFoundException($"Cound not find {file}");
-            }
-
-            return LoadDriver(file, "SnowflakeDriverInit");
-        }
-
-        /// <summary>
-        /// Loads the Snowflake Go driver from the current directory using the default name and entry point.
-        /// </summary>
-        /// <param name="file">The file to load.</param>
-        /// <param name="entryPoint">The entry point of the file.</param>
-        /// <returns>An <see cref="AdbcDriver"/> based on the Snowflake Go driver.</returns>
-        public static AdbcDriver LoadDriver(string file, string entryPoint)
-        {
-            AdbcDriver snowflakeDriver = CAdbcDriverImporter.Load(file, entryPoint);
-
-            return snowflakeDriver;
+            return new SnowflakeDriverLoader().FindAndLoadDriver();
         }
     }
 }

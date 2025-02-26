@@ -73,7 +73,7 @@ Usage
 =====
 
 To connect to a database, supply the "uri" parameter when constructing
-the :cpp:class:`AdbcDatabase`.  This should be a filename or `URI
+the :c:struct:`AdbcDatabase`.  This should be a filename or `URI
 filename <https://www.sqlite.org/c3ref/open.html#urifilenamesinsqlite3open>`_.
 If omitted, it will default to an in-memory database, but one that is
 shared across all connections.
@@ -85,7 +85,7 @@ shared across all connections.
 
       .. code-block:: cpp
 
-         #include "adbc.h"
+         #include "arrow-adbc/adbc.h"
 
          // Ignoring error handling
          struct AdbcDatabase database;
@@ -103,6 +103,8 @@ shared across all connections.
 
          with adbc_driver_sqlite.dbapi.connect() as conn:
              pass
+
+      For more examples, see :doc:`../python/recipe/sqlite`.
 
    .. tab-item:: R
       :sync: r
@@ -177,7 +179,7 @@ To load an extension, three things are necessary:
 3. Set the entrypoint
 
 These options can only be set after the connection is fully initialized with
-:cpp:func:`AdbcConnectionInit`.
+:c:func:`AdbcConnectionInit`.
 
 Options
 ~~~~~~~
@@ -273,3 +275,10 @@ Driver-specific options:
 ``adbc.sqlite.query.batch_rows``
     The size of batches to read.  Hence, this also controls how many
     rows are read to infer the Arrow type.
+
+Software Versions
+=================
+
+For Python wheels, the shipped version of SQLite is 3.40.1.  For conda-forge
+packages, the version of sqlite is the same as the version of sqlite in your
+Conda environment.

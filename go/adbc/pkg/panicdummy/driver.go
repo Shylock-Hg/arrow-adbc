@@ -26,7 +26,7 @@ package main
 
 // #cgo CFLAGS: -DADBC_EXPORTING
 // #cgo CXXFLAGS: -std=c++11 -DADBC_EXPORTING
-// #include "../../drivermgr/adbc.h"
+// #include "../../drivermgr/arrow-adbc/adbc.h"
 // #include "utils.h"
 // #include <errno.h>
 // #include <stdint.h>
@@ -52,6 +52,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"runtime/cgo"
@@ -61,11 +62,10 @@ import (
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/driver/panicdummy"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/cdata"
-	"github.com/apache/arrow/go/v16/arrow/memory"
-	"github.com/apache/arrow/go/v16/arrow/memory/mallocator"
-	"golang.org/x/exp/slog"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/cdata"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/memory/mallocator"
 )
 
 // Must use malloc() to respect CGO rules
@@ -73,8 +73,7 @@ var drv = panicdummy.NewDriver(mallocator.NewMallocator())
 
 // Flag set if any method panic()ed - afterwards all calls to driver will fail
 // since internal state of driver is unknown
-// (Can't use atomic.Bool since that's Go 1.19)
-var globalPoison int32 = 0
+var globalPoison atomic.Bool
 
 const errPrefix = "[PanicDummy] "
 const logLevelEnvVar = "ADBC_DRIVER_PANICDUMMY_LOG_LEVEL"
@@ -103,7 +102,7 @@ func setErrWithDetails(err *C.struct_AdbcError, adbcError adbc.Error) {
 		return
 	}
 
-	cErrPtr := C.malloc(C.sizeof_struct_PanicDummyError)
+	cErrPtr := C.calloc(C.sizeof_struct_PanicDummyError, C.size_t(1))
 	cErr := (*C.struct_PanicDummyError)(cErrPtr)
 	cErr.message = C.CString(adbcError.Msg)
 	err.message = cErr.message
@@ -159,7 +158,7 @@ func errToAdbcErr(adbcerr *C.struct_AdbcError, err error) adbc.Status {
 
 // We panicked; make all API functions error and dump stack traces
 func poison(err *C.struct_AdbcError, fname string, e interface{}) C.AdbcStatusCode {
-	if atomic.SwapInt32(&globalPoison, 1) == 0 {
+	if !globalPoison.Swap(true) {
 		// Only print stack traces on the first occurrence
 		buf := make([]byte, 1<<20)
 		length := runtime.Stack(buf, true)
@@ -213,7 +212,7 @@ func printLoggingHelp() {
 // handle.
 func createHandle(hndl cgo.Handle) unsafe.Pointer {
 	// uintptr_t* hptr = malloc(sizeof(uintptr_t));
-	hptr := (*C.uintptr_t)(C.malloc(C.sizeof_uintptr_t))
+	hptr := (*C.uintptr_t)(C.calloc(C.sizeof_uintptr_t, C.size_t(1)))
 	// *hptr = (uintptr)hndl;
 	*hptr = C.uintptr_t(uintptr(hndl))
 	return unsafe.Pointer(hptr)
@@ -265,7 +264,7 @@ func (c *cancellableContext) cancelContext() {
 }
 
 func checkDBAlloc(db *C.struct_AdbcDatabase, err *C.struct_AdbcError, fname string) bool {
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "%s: Go panicked, driver is in unknown state", fname)
 		return false
 	}
@@ -567,7 +566,7 @@ func PanicDummyDatabaseNew(db *C.struct_AdbcDatabase, err *C.struct_AdbcError) (
 			code = poison(err, "AdbcDatabaseNew", e)
 		}
 	}()
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "AdbcDatabaseNew: Go panicked, driver is in unknown state")
 		return C.ADBC_STATUS_INTERNAL
 	}
@@ -594,11 +593,15 @@ func PanicDummyDatabaseRelease(db *C.struct_AdbcDatabase, err *C.struct_AdbcErro
 	h := (*(*cgo.Handle)(db.private_data))
 
 	cdb := h.Value().(*cDatabase)
-	cdb.db.Close()
-	cdb.db = nil
+	if cdb.db != nil {
+		cdb.db.Close()
+		cdb.db = nil
+	}
 	cdb.opts = nil
-	C.free(unsafe.Pointer(db.private_data))
-	db.private_data = nil
+	if db.private_data != nil {
+		C.free(unsafe.Pointer(db.private_data))
+		db.private_data = nil
+	}
 	h.Delete()
 	// manually trigger GC for two reasons:
 	//  1. ASAN expects the release callback to be called before
@@ -708,7 +711,7 @@ type cConn struct {
 }
 
 func checkConnAlloc(cnxn *C.struct_AdbcConnection, err *C.struct_AdbcError, fname string) bool {
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "%s: Go panicked, driver is in unknown state", fname)
 		return false
 	}
@@ -839,7 +842,7 @@ func PanicDummyConnectionNew(cnxn *C.struct_AdbcConnection, err *C.struct_AdbcEr
 			code = poison(err, "AdbcConnectionNew", e)
 		}
 	}()
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "AdbcConnectionNew: Go panicked, driver is in unknown state")
 		return C.ADBC_STATUS_INTERNAL
 	}
@@ -1284,7 +1287,7 @@ type cStmt struct {
 }
 
 func checkStmtAlloc(stmt *C.struct_AdbcStatement, err *C.struct_AdbcError, fname string) bool {
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "%s: Go panicked, driver is in unknown state", fname)
 		return false
 	}
@@ -1414,7 +1417,7 @@ func PanicDummyStatementNew(cnxn *C.struct_AdbcConnection, stmt *C.struct_AdbcSt
 			code = poison(err, "AdbcStatementNew", e)
 		}
 	}()
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "AdbcStatementNew: Go panicked, driver is in unknown state")
 		return C.ADBC_STATUS_INTERNAL
 	}
@@ -1445,7 +1448,7 @@ func PanicDummyStatementRelease(stmt *C.struct_AdbcStatement, err *C.struct_Adbc
 			code = poison(err, "AdbcStatementRelease", e)
 		}
 	}()
-	if atomic.LoadInt32(&globalPoison) != 0 {
+	if globalPoison.Load() {
 		setErr(err, "AdbcStatementRelease: Go panicked, driver is in unknown state")
 		return C.ADBC_STATUS_INTERNAL
 	}
@@ -1794,7 +1797,7 @@ func PanicDummyStatementExecutePartitions(stmt *C.struct_AdbcStatement, schema *
 	for _, p := range part.PartitionIDs {
 		totalLen += len(p)
 	}
-	partitions.private_data = C.malloc(C.size_t(totalLen))
+	partitions.private_data = C.calloc(C.size_t(totalLen), C.size_t(1))
 	dst := fromCArr[byte]((*byte)(partitions.private_data), totalLen)
 
 	partIDs := fromCArr[*C.cuint8_t](partitions.partitions, int(partitions.num_partitions))
