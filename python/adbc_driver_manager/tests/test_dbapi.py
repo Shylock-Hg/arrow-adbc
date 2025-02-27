@@ -17,6 +17,7 @@
 
 import pandas
 import pyarrow
+import pyarrow.dataset
 import pytest
 from pandas.testing import assert_frame_equal
 
@@ -109,7 +110,7 @@ def test_get_objects(sqlite):
     assert metadata[0]["catalog_name"] == "main"
     schemas = metadata[0]["catalog_db_schemas"]
     assert len(schemas) == 1
-    assert schemas[0]["db_schema_name"] is None
+    assert schemas[0]["db_schema_name"] == ""
     tables = schemas[0]["db_schema_tables"]
     assert len(tables) == 1
     assert tables[0]["table_name"] == "temporary"
@@ -200,10 +201,10 @@ def test_partitions(sqlite):
 @pytest.mark.sqlite
 def test_query_fetch_py(sqlite):
     with sqlite.cursor() as cur:
-        cur.execute('SELECT 1, "foo", 2.0')
+        cur.execute("SELECT 1, 'foo' AS foo, 2.0")
         assert cur.description == [
             ("1", dbapi.NUMBER, None, None, None, None, None),
-            ('"foo"', dbapi.STRING, None, None, None, None, None),
+            ("foo", dbapi.STRING, None, None, None, None, None),
             ("2.0", dbapi.NUMBER, None, None, None, None, None),
         ]
         assert cur.rownumber == 0
@@ -211,26 +212,26 @@ def test_query_fetch_py(sqlite):
         assert cur.rownumber == 1
         assert cur.fetchone() is None
 
-        cur.execute('SELECT 1, "foo", 2.0')
+        cur.execute("SELECT 1, 'foo', 2.0")
         assert cur.fetchmany() == [(1, "foo", 2.0)]
         assert cur.fetchmany() == []
 
-        cur.execute('SELECT 1, "foo", 2.0')
+        cur.execute("SELECT 1, 'foo', 2.0")
         assert cur.fetchall() == [(1, "foo", 2.0)]
         assert cur.fetchall() == []
 
-        cur.execute('SELECT 1, "foo", 2.0')
+        cur.execute("SELECT 1, 'foo', 2.0")
         assert list(cur) == [(1, "foo", 2.0)]
 
 
 @pytest.mark.sqlite
 def test_query_fetch_arrow(sqlite):
     with sqlite.cursor() as cur:
-        cur.execute('SELECT 1, "foo", 2.0')
+        cur.execute("SELECT 1, 'foo' AS foo, 2.0")
         assert cur.fetch_arrow_table() == pyarrow.table(
             {
                 "1": [1],
-                '"foo"': ["foo"],
+                "foo": ["foo"],
                 "2.0": [2.0],
             }
         )
@@ -239,13 +240,13 @@ def test_query_fetch_arrow(sqlite):
 @pytest.mark.sqlite
 def test_query_fetch_df(sqlite):
     with sqlite.cursor() as cur:
-        cur.execute('SELECT 1, "foo", 2.0')
+        cur.execute("SELECT 1, 'foo' AS foo, 2.0")
         assert_frame_equal(
             cur.fetch_df(),
             pandas.DataFrame(
                 {
                     "1": [1],
-                    '"foo"': ["foo"],
+                    "foo": ["foo"],
                     "2.0": [2.0],
                 }
             ),
@@ -349,6 +350,15 @@ def test_fetch_empty(sqlite):
         cur.execute("CREATE TABLE foo (bar)")
         cur.execute("SELECT * FROM foo")
         assert cur.fetchall() == []
+
+
+@pytest.mark.sqlite
+def test_reader(sqlite, tmp_path) -> None:
+    # Regression test for https://github.com/apache/arrow-adbc/issues/1523
+    with sqlite.cursor() as cur:
+        cur.execute("SELECT 1")
+        reader = cur.fetch_record_batch()
+        pyarrow.dataset.write_dataset(reader, tmp_path, format="parquet")
 
 
 @pytest.mark.sqlite

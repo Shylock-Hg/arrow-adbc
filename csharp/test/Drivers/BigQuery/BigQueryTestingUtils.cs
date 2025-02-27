@@ -39,7 +39,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
         {
             Dictionary<string, string> parameters = GetBigQueryParameters(testConfiguration);
             AdbcDatabase database = new BigQueryDriver().Open(parameters);
-            AdbcConnection connection = database.Connect(new Dictionary<string,string>());
+            AdbcConnection connection = database.Connect(new Dictionary<string, string>());
 
             return connection;
         }
@@ -49,12 +49,14 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
         /// </summary>
         /// <param name="testConfiguration"><see cref="BigQueryTestConfiguration"/></param>
         /// <returns></returns>
-        internal static Dictionary<string,string> GetBigQueryParameters(BigQueryTestConfiguration testConfiguration)
+        internal static Dictionary<string, string> GetBigQueryParameters(BigQueryTestConfiguration testConfiguration)
         {
-            Dictionary<string, string> parameters = new Dictionary<string, string>
+            Dictionary<string, string> parameters = new Dictionary<string, string>{};
+
+            if (!string.IsNullOrEmpty(testConfiguration.ProjectId))
             {
-               { BigQueryParameters.ProjectId, testConfiguration.ProjectId },
-            };
+                parameters.Add(BigQueryParameters.ProjectId, testConfiguration.ProjectId!);
+            }
 
             if (!string.IsNullOrEmpty(testConfiguration.JsonCredential))
             {
@@ -72,6 +74,30 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.BigQuery
             if (!string.IsNullOrEmpty(testConfiguration.Scopes))
             {
                 parameters.Add(BigQueryParameters.Scopes, testConfiguration.Scopes);
+            }
+
+            if (testConfiguration.AllowLargeResults)
+            {
+                parameters.Add(BigQueryParameters.AllowLargeResults, testConfiguration.AllowLargeResults.ToString());
+            }
+
+            parameters.Add(BigQueryParameters.IncludeConstraintsWithGetObjects, testConfiguration.IncludeTableConstraints.ToString());
+
+            parameters.Add(BigQueryParameters.IncludePublicProjectId, testConfiguration.IncludePublicProjectId.ToString());
+
+            if (!string.IsNullOrEmpty(testConfiguration.LargeResultsDestinationTable))
+            {
+                parameters.Add(BigQueryParameters.LargeResultsDestinationTable, testConfiguration.LargeResultsDestinationTable);
+            }
+
+            if (testConfiguration.TimeoutMinutes.HasValue)
+            {
+                parameters.Add(BigQueryParameters.GetQueryResultsOptionsTimeoutMinutes, testConfiguration.TimeoutMinutes.Value.ToString());
+            }
+
+            if (testConfiguration.MaxStreamCount.HasValue)
+            {
+                parameters.Add(BigQueryParameters.MaxFetchConcurrency, testConfiguration.MaxStreamCount.Value.ToString());
             }
 
             return parameters;

@@ -23,6 +23,18 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "chore: "
+  - package-ecosystem: "gomod"
+    directory: "/go/adbc/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(go/adbc): "
+  - package-ecosystem: "maven"
+    directory: "/java/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(java): "
   - package-ecosystem: "nuget"
     directory: "/csharp/"
     schedule:
@@ -39,3 +51,18 @@ updates:
       - dependency-name: "System.*"
         update-types:
           - "version-update:semver-major"
+  - package-ecosystem: "cargo"
+    directory: "/rust/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(rust): "
+    groups:
+      arrow:
+        applies-to: version-updates
+        patterns:
+          - "arrow-*"
+      datafusion:
+        applies-to: version-updates
+        patterns:
+          - "datafusion*"
