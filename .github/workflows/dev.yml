@@ -28,6 +28,11 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # 'bash' will expand to -eo pipefail
+    shell: bash
+
 jobs:
   pre-commit:
     name: "pre-commit"
@@ -37,11 +42,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go/adbc/go.mod'
           check-latest: true
       - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - name: install golangci-lint
         run: |
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.49.0

@@ -22,7 +22,7 @@
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v2.3.0
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
     hooks:
     - id: check-xml
     - id: check-yaml
@@ -40,7 +40,7 @@ repos:
     - id: trailing-whitespace
       exclude: "^r/.*?/_snaps/.*?.md$"
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: "v14.0.6"
+    rev: "v18.1.7"
     hooks:
       - id: clang-format
         types_or: [c, c++]
@@ -50,46 +50,51 @@ repos:
     - id: cmake-format
       args: [--in-place]
   - repo: https://github.com/cpplint/cpplint
-    rev: 1.6.1
+    rev: f4363d7fc0d5f38c4fd41b658e069e96583da0d5  # 2.0.0
     hooks:
     - id: cpplint
+      types_or: [c++]
       args:
         # From Arrow's config
         - "--filter=-whitespace/comments,-whitespace/indent,-readability/braces,-readability/casting,-readability/todo,-readability/alt_tokens,-build/header_guard,-build/c++11,-build/include_order,-build/include_subdir,-runtime/references"
         - "--linelength=90"
         - "--verbose=2"
   - repo: https://github.com/golangci/golangci-lint
-    rev: v1.49.0
+    rev: v1.64.5
     hooks:
     - id: golangci-lint
       entry: bash -c 'cd go/adbc && golangci-lint run --fix --timeout 5m'
-      types_or: [go]
+      types_or: [go, go-mod]
   - repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
-    rev: v2.3.0
+    rev: v2.14.0
     hooks:
     - id: pretty-format-golang
+      args: [--autofix]
+      types_or: [go]
     - id: pretty-format-java
       args: [--autofix]
       types_or: [java]
   - repo: https://github.com/psf/black
-    rev: 22.3.0
+    rev: 25.1.0
     hooks:
     - id: black
       types_or: [pyi, python]
   - repo: https://github.com/PyCQA/flake8
-    rev: 4.0.1
+    rev: 7.1.2
     hooks:
     - id: flake8
       types_or: [python]
   - repo: https://github.com/PyCQA/isort
-    rev: 5.12.0
+    rev: 6.0.0
     hooks:
     - id: isort
       types_or: [python]
-  # TODO: Change this to vala-lang/vala-lint after
-  # https://github.com/vala-lang/vala-lint/pull/179 is merged.
-  - repo: https://github.com/kou/vala-lint
-    rev: pre-commit-hook
+  - repo: https://github.com/MarcoGorelli/cython-lint
+    rev: v0.16.2
+    hooks:
+    - id: cython-lint
+  - repo: https://github.com/vala-lang/vala-lint
+    rev: 8ae2bb65fe66458263d94711ae4ddd978faece00
     hooks:
     - id: vala-lint
   - repo: local
@@ -100,10 +105,16 @@ repos:
       pass_filenames: false
       entry: "./ci/scripts/run_rat_local.sh"
     - id: check-cgo-adbc-header
-      name: Ensure CGO adbc.h is sync'd
+      name: Ensure CGO adbc.h is syncd
       language: script
       pass_filenames: true
-      files: '(c/driver_manager/adbc_driver_manager\.)|(^adbc\.h)'
+      files: '^c/include/arrow-adbc/.*\.h$'
       entry: "./ci/scripts/run_cgo_drivermgr_check.sh"
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+    - id: fmt
+      name: rustfmt
+      args: ["--all", "--manifest-path", "rust/Cargo.toml", "--"]
 
 exclude: "^c/vendor/.*"

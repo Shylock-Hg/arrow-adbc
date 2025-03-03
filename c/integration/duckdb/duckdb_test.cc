@@ -16,9 +16,10 @@
 // under the License.
 
 #include <cstdlib>
+#include <string>
 
-#include <adbc.h>
-#include <driver_manager/adbc_driver_manager.h>
+#include <arrow-adbc/adbc.h>
+#include <arrow-adbc/adbc_driver_manager.h>
 #include <duckdb/common/adbc/adbc-init.hpp>
 
 #include "validation/adbc_validation.h"

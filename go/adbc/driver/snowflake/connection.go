@@ -21,24 +21,38 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"embed"
+	"errors"
 	"fmt"
 	"io"
-	"regexp"
+	"io/fs"
+	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/snowflakedb/gosnowflake"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	defaultStatementQueueSize  = 200
-	defaultPrefetchConcurrency = 10
+	defaultStatementQueueSize  = 100
+	defaultPrefetchConcurrency = 5
+
+	queryTemplateGetObjectsAll           = "get_objects_all.sql"
+	queryTemplateGetObjectsDbSchemas     = "get_objects_dbschemas.sql"
+	queryTemplateGetObjectsTables        = "get_objects_tables.sql"
+	queryTemplateGetObjectsTerseCatalogs = "get_objects_terse_catalogs.sql"
 )
+
+//go:embed queries/*
+var queryTemplates embed.FS
 
 type snowflakeConn interface {
 	driver.Conn
@@ -50,740 +64,427 @@ type snowflakeConn interface {
 	QueryArrowStream(context.Context, string, ...driver.NamedValue) (gosnowflake.ArrowStreamLoader, error)
 }
 
-type cnxn struct {
-	cn    snowflakeConn
-	db    *databaseImpl
-	ctor  gosnowflake.Connector
-	sqldb *sql.DB
+type connectionImpl struct {
+	driverbase.ConnectionImplBase
+
+	cn   snowflakeConn
+	db   *databaseImpl
+	ctor driver.Connector
 
 	activeTransaction bool
 	useHighPrecision  bool
 }
 
-// Metadata methods
-// Generally these methods return an array.RecordReader that
-// can be consumed to retrieve metadata about the database as Arrow
-// data. The returned metadata has an expected schema given in the
-// doc strings of the specific methods. Schema fields are nullable
-// unless otherwise marked. While no Statement is used in these
-// methods, the result set may count as an active statement to the
-// driver for the purposes of concurrency management (e.g. if the
-// driver has a limit on concurrent active statements and it must
-// execute a SQL query internally in order to implement the metadata
-// method).
-//
-// Some methods accept "search pattern" arguments, which are strings
-// that can contain the special character "%" to match zero or more
-// characters, or "_" to match exactly one character. (See the
-// documentation of DatabaseMetaData in JDBC or "Pattern Value Arguments"
-// in the ODBC documentation.) Escaping is not currently supported.
-// GetInfo returns metadata about the database/driver.
-//
-// The result is an Arrow dataset with the following schema:
-//
-//	Field Name									| Field Type
-//	----------------------------|-----------------------------
-//	info_name					   				| uint32 not null
-//	info_value									| INFO_SCHEMA
-//
-// INFO_SCHEMA is a dense union with members:
-//
-//	Field Name (Type Code)			| Field Type
-//	----------------------------|-----------------------------
-//	string_value (0)						| utf8
-//	bool_value (1)							| bool
-//	int64_value (2)							| int64
-//	int32_bitmask (3)						| int32
-//	string_list (4)							| list<utf8>
-//	int32_to_int32_list_map (5)	| map<int32, list<int32>>
-//
-// Each metadatum is identified by an integer code. The recognized
-// codes are defined as constants. Codes [0, 10_000) are reserved
-// for ADBC usage. Drivers/vendors will ignore requests for unrecognized
-// codes (the row will be omitted from the result).
-func (c *cnxn) GetInfo(ctx context.Context, infoCodes []adbc.InfoCode) (array.RecordReader, error) {
-	const strValTypeID arrow.UnionTypeCode = 0
-	const intValTypeID arrow.UnionTypeCode = 2
-
-	if len(infoCodes) == 0 {
-		infoCodes = infoSupportedCodes
+func escapeSingleQuoteForLike(arg string) string {
+	if len(arg) == 0 {
+		return arg
 	}
 
-	bldr := array.NewRecordBuilder(c.db.Alloc, adbc.GetInfoSchema)
-	defer bldr.Release()
-	bldr.Reserve(len(infoCodes))
+	idx := strings.IndexByte(arg, '\'')
+	if idx == -1 {
+		return arg
+	}
 
-	infoNameBldr := bldr.Field(0).(*array.Uint32Builder)
-	infoValueBldr := bldr.Field(1).(*array.DenseUnionBuilder)
-	strInfoBldr := infoValueBldr.Child(int(strValTypeID)).(*array.StringBuilder)
-	intInfoBldr := infoValueBldr.Child(int(intValTypeID)).(*array.Int64Builder)
+	var b strings.Builder
+	b.Grow(len(arg))
 
-	for _, code := range infoCodes {
-		switch code {
-		case adbc.InfoDriverName:
-			infoNameBldr.Append(uint32(code))
-			infoValueBldr.Append(strValTypeID)
-			strInfoBldr.Append(infoDriverName)
-		case adbc.InfoDriverVersion:
-			infoNameBldr.Append(uint32(code))
-			infoValueBldr.Append(strValTypeID)
-			strInfoBldr.Append(infoDriverVersion)
-		case adbc.InfoDriverArrowVersion:
-			infoNameBldr.Append(uint32(code))
-			infoValueBldr.Append(strValTypeID)
-			strInfoBldr.Append(infoDriverArrowVersion)
-		case adbc.InfoDriverADBCVersion:
-			infoNameBldr.Append(uint32(code))
-			infoValueBldr.Append(intValTypeID)
-			intInfoBldr.Append(adbc.AdbcVersion1_1_0)
-		case adbc.InfoVendorName:
-			infoNameBldr.Append(uint32(code))
-			infoValueBldr.Append(strValTypeID)
-			strInfoBldr.Append(infoVendorName)
+	for {
+		before, after, found := strings.Cut(arg, `'`)
+		b.WriteString(before)
+		if !found {
+			return b.String()
+		}
+
+		if before[len(before)-1] != '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte('\'')
+		arg = after
+	}
+}
+
+func getQueryID(ctx context.Context, query string, driverConn driver.QueryerContext) (string, error) {
+	rows, err := driverConn.QueryContext(ctx, query, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return rows.(gosnowflake.SnowflakeRows).GetQueryID(), rows.Close()
+}
+
+const (
+	objSchemas   = "SCHEMAS"
+	objDatabases = "DATABASES"
+	objViews     = "VIEWS"
+	objTables    = "TABLES"
+	objObjects   = "OBJECTS"
+)
+
+func addLike(query string, pattern *string) string {
+	if pattern != nil && len(*pattern) > 0 && *pattern != "%" && *pattern != ".*" {
+		query += " LIKE '" + escapeSingleQuoteForLike(*pattern) + "'"
+	}
+	return query
+}
+
+func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, catalog, dbSchema, tableName *string, outQueryID *string) {
+	grp.Go(func() error {
+		query := "SHOW TERSE /* ADBC:getObjects */ " + objType
+		switch objType {
+		case objDatabases:
+			query = addLike(query, catalog)
+			query += " IN ACCOUNT"
+		case objSchemas:
+			query = addLike(query, dbSchema)
+
+			if catalog == nil || isWildcardStr(*catalog) {
+				query += " IN ACCOUNT"
+			} else {
+				query += " IN DATABASE " + quoteTblName(*catalog)
+			}
+		case objViews, objTables, objObjects:
+			query = addLike(query, tableName)
+
+			if catalog == nil || isWildcardStr(*catalog) {
+				query += " IN ACCOUNT"
+			} else {
+				escapedCatalog := quoteTblName(*catalog)
+				if dbSchema == nil || isWildcardStr(*dbSchema) {
+					query += " IN DATABASE " + escapedCatalog
+				} else {
+					query += " IN SCHEMA " + escapedCatalog + "." + quoteTblName(*dbSchema)
+				}
+			}
 		default:
-			infoNameBldr.Append(uint32(code))
-			infoValueBldr.AppendNull()
+			return fmt.Errorf("unimplemented object type")
+		}
+
+		var err error
+		*outQueryID, err = getQueryID(ctx, query, conn)
+		return err
+	})
+}
+
+func isWildcardStr(ident string) bool {
+	return strings.ContainsAny(ident, "_%")
+}
+
+func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog, dbSchema, tableName, columnName *string, tableType []string) (array.RecordReader, error) {
+	var (
+		pkQueryID, fkQueryID, uniqueQueryID, terseDbQueryID string
+		showSchemaQueryID, tableQueryID                     string
+	)
+
+	conn := c.cn
+	var hasViews, hasTables bool
+	for _, t := range tableType {
+		if strings.EqualFold("VIEW", t) {
+			hasViews = true
+		} else if strings.EqualFold("TABLE", t) {
+			hasTables = true
 		}
 	}
 
-	final := bldr.NewRecord()
-	defer final.Release()
-	return array.NewRecordReader(adbc.GetInfoSchema, []arrow.Record{final})
-}
+	// force empty result from SHOW TABLES if tableType list is not empty
+	// and does not contain TABLE or VIEW in the list.
+	// we need this because we should have non-null db_schema_tables when
+	// depth is Tables, Columns or All.
+	var badTableType = "tabletypedoesnotexist"
+	if len(tableType) > 0 && depth >= adbc.ObjectDepthTables && !hasViews && !hasTables {
+		tableName = &badTableType
+		tableType = []string{"TABLE"}
+	}
 
-// GetObjects gets a hierarchical view of all catalogs, database schemas,
-// tables, and columns.
-//
-// The result is an Arrow Dataset with the following schema:
-//
-//	Field Name									| Field Type
-//	----------------------------|----------------------------
-//	catalog_name								| utf8
-//	catalog_db_schemas					| list<DB_SCHEMA_SCHEMA>
-//
-// DB_SCHEMA_SCHEMA is a Struct with the fields:
-//
-//	Field Name									| Field Type
-//	----------------------------|----------------------------
-//	db_schema_name							| utf8
-//	db_schema_tables						|	list<TABLE_SCHEMA>
-//
-// TABLE_SCHEMA is a Struct with the fields:
-//
-//	Field Name									| Field Type
-//	----------------------------|----------------------------
-//	table_name									| utf8 not null
-//	table_type									|	utf8 not null
-//	table_columns								| list<COLUMN_SCHEMA>
-//	table_constraints						| list<CONSTRAINT_SCHEMA>
-//
-// COLUMN_SCHEMA is a Struct with the fields:
-//
-//		Field Name 									| Field Type					| Comments
-//		----------------------------|---------------------|---------
-//		column_name									| utf8 not null				|
-//		ordinal_position						| int32								| (1)
-//		remarks											| utf8								| (2)
-//		xdbc_data_type							| int16								| (3)
-//		xdbc_type_name							| utf8								| (3)
-//		xdbc_column_size						| int32								| (3)
-//		xdbc_decimal_digits					| int16								| (3)
-//		xdbc_num_prec_radix					| int16								| (3)
-//		xdbc_nullable								| int16								| (3)
-//		xdbc_column_def							| utf8								| (3)
-//		xdbc_sql_data_type					| int16								| (3)
-//		xdbc_datetime_sub						| int16								| (3)
-//		xdbc_char_octet_length			| int32								| (3)
-//		xdbc_is_nullable						| utf8								| (3)
-//		xdbc_scope_catalog					| utf8								| (3)
-//		xdbc_scope_schema						| utf8								| (3)
-//		xdbc_scope_table						| utf8								| (3)
-//		xdbc_is_autoincrement				| bool								| (3)
-//		xdbc_is_generatedcolumn			| bool								| (3)
-//
-//	 1. The column's ordinal position in the table (starting from 1).
-//	 2. Database-specific description of the column.
-//	 3. Optional Value. Should be null if not supported by the driver.
-//	    xdbc_values are meant to provide JDBC/ODBC-compatible metadata
-//	    in an agnostic manner.
-//
-// CONSTRAINT_SCHEMA is a Struct with the fields:
-//
-//	Field Name									| Field Type					| Comments
-//	----------------------------|---------------------|---------
-//	constraint_name							| utf8								|
-//	constraint_type							| utf8 not null				| (1)
-//	constraint_column_names			| list<utf8> not null | (2)
-//	constraint_column_usage			| list<USAGE_SCHEMA>	| (3)
-//
-// 1. One of 'CHECK', 'FOREIGN KEY', 'PRIMARY KEY', or 'UNIQUE'.
-// 2. The columns on the current table that are constrained, in order.
-// 3. For FOREIGN KEY only, the referenced table and columns.
-//
-// USAGE_SCHEMA is a Struct with fields:
-//
-//	Field Name									|	Field Type
-//	----------------------------|----------------------------
-//	fk_catalog									| utf8
-//	fk_db_schema								| utf8
-//	fk_table										| utf8 not null
-//	fk_column_name							| utf8 not null
-//
-// For the parameters: If nil is passed, then that parameter will not
-// be filtered by at all. If an empty string, then only objects without
-// that property (ie: catalog or db schema) will be returned.
-//
-// tableName and columnName must be either nil (do not filter by
-// table name or column name) or non-empty.
-//
-// All non-empty, non-nil strings should be a search pattern (as described
-// earlier).
-func (c *cnxn) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) (array.RecordReader, error) {
-	metadataRecords, err := c.populateMetadata(ctx, depth, catalog, dbSchema, tableName, columnName, tableType)
+	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
+	queryFile := queryTemplateGetObjectsAll
+	switch depth {
+	case adbc.ObjectDepthCatalogs:
+		queryFile = queryTemplateGetObjectsTerseCatalogs
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+			catalog, dbSchema, tableName, &terseDbQueryID)
+	case adbc.ObjectDepthDBSchemas:
+		queryFile = queryTemplateGetObjectsDbSchemas
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
+			catalog, dbSchema, tableName, &showSchemaQueryID)
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+			catalog, dbSchema, tableName, &terseDbQueryID)
+	case adbc.ObjectDepthTables:
+		queryFile = queryTemplateGetObjectsTables
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
+			catalog, dbSchema, tableName, &showSchemaQueryID)
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+			catalog, dbSchema, tableName, &terseDbQueryID)
+
+		objType := objObjects
+		if len(tableType) == 1 {
+			if strings.EqualFold("VIEW", tableType[0]) {
+				objType = objViews
+			} else if strings.EqualFold("TABLE", tableType[0]) {
+				objType = objTables
+			}
+		}
+
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
+			catalog, dbSchema, tableName, &tableQueryID)
+	default:
+		var suffix string
+		if catalog == nil || isWildcardStr(*catalog) {
+			suffix = " IN ACCOUNT"
+		} else {
+			escapedCatalog := quoteTblName(*catalog)
+			if dbSchema == nil || isWildcardStr(*dbSchema) {
+				suffix = " IN DATABASE " + escapedCatalog
+			} else {
+				escapedSchema := quoteTblName(*dbSchema)
+				if tableName == nil || isWildcardStr(*tableName) {
+					suffix = " IN SCHEMA " + escapedCatalog + "." + escapedSchema
+				} else {
+					escapedTable := quoteTblName(*tableName)
+					suffix = " IN TABLE " + escapedCatalog + "." + escapedSchema + "." + escapedTable
+				}
+			}
+		}
+
+		// Detailed constraint info not available in information_schema
+		// Need to dispatch SHOW queries and use conn.Raw to extract the queryID for reuse in GetObjects query
+		gQueryIDs.Go(func() (err error) {
+			pkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */"+suffix, conn)
+			return err
+		})
+
+		gQueryIDs.Go(func() (err error) {
+			fkQueryID, err = getQueryID(gQueryIDsCtx, "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */"+suffix, conn)
+			return err
+		})
+
+		gQueryIDs.Go(func() (err error) {
+			uniqueQueryID, err = getQueryID(gQueryIDsCtx, "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */"+suffix, conn)
+			return err
+		})
+
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+			catalog, dbSchema, tableName, &terseDbQueryID)
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
+			catalog, dbSchema, tableName, &showSchemaQueryID)
+
+		objType := objObjects
+		if len(tableType) == 1 {
+			if strings.EqualFold("VIEW", tableType[0]) {
+				objType = objViews
+			} else if strings.EqualFold("TABLE", tableType[0]) {
+				objType = objTables
+			}
+		}
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
+			catalog, dbSchema, tableName, &tableQueryID)
+	}
+
+	queryBytes, err := fs.ReadFile(queryTemplates, path.Join("queries", queryFile))
 	if err != nil {
 		return nil, err
 	}
 
-	g := internal.GetObjects{Ctx: ctx, Depth: depth, Catalog: catalog, DbSchema: dbSchema, TableName: tableName, ColumnName: columnName, TableType: tableType}
-	g.MetadataRecords = metadataRecords
-	if err := g.Init(c.db.Alloc, c.getObjectsDbSchemas, c.getObjectsTables); err != nil {
+	// Need constraint subqueries to complete before we can query GetObjects
+	if err := gQueryIDs.Wait(); err != nil {
 		return nil, err
 	}
-	defer g.Release()
 
-	uniqueCatalogs := make(map[string]bool)
-	for _, data := range metadataRecords {
-		if !data.Dbname.Valid {
-			continue
-		}
+	args := []sql.NamedArg{
+		// Optional filter patterns
+		driverbase.PatternToNamedArg("CATALOG", catalog),
+		driverbase.PatternToNamedArg("DB_SCHEMA", dbSchema),
+		driverbase.PatternToNamedArg("TABLE", tableName),
+		driverbase.PatternToNamedArg("COLUMN", columnName),
 
-		if _, exists := uniqueCatalogs[data.Dbname.String]; !exists {
-			uniqueCatalogs[data.Dbname.String] = true
-			g.AppendCatalog(data.Dbname.String)
+		// QueryIDs for constraint data if depth is tables or deeper
+		// or if the depth is catalog and catalog is null
+		sql.Named("PK_QUERY_ID", pkQueryID),
+		sql.Named("FK_QUERY_ID", fkQueryID),
+		sql.Named("UNIQUE_QUERY_ID", uniqueQueryID),
+		sql.Named("SHOW_DB_QUERY_ID", terseDbQueryID),
+		sql.Named("SHOW_SCHEMA_QUERY_ID", showSchemaQueryID),
+		sql.Named("SHOW_TABLE_QUERY_ID", tableQueryID),
+	}
+
+	nvargs := make([]driver.NamedValue, len(args))
+	for i, arg := range args {
+		nvargs[i] = driver.NamedValue{
+			Name:    arg.Name,
+			Ordinal: i + 1,
+			Value:   arg.Value,
 		}
 	}
 
-	return g.Finish()
+	query := string(queryBytes)
+	rows, err := conn.QueryContext(ctx, query, nvargs)
+	if err != nil {
+		return nil, errToAdbcErr(adbc.StatusIO, err)
+	}
+	defer rows.Close()
+
+	catalogCh := make(chan driverbase.GetObjectsInfo, runtime.NumCPU())
+	errCh := make(chan error)
+
+	go func() {
+		defer close(catalogCh)
+		dest := make([]driver.Value, len(rows.Columns()))
+		for {
+			if err := rows.Next(dest); err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				errCh <- errToAdbcErr(adbc.StatusInvalidData, err)
+				return
+			}
+
+			var getObjectsCatalog driverbase.GetObjectsInfo
+			if err := getObjectsCatalog.Scan(dest[0]); err != nil {
+				errCh <- errToAdbcErr(adbc.StatusInvalidData, err)
+				return
+			}
+
+			// A few columns need additional processing outside of Snowflake
+			for i, sch := range getObjectsCatalog.CatalogDbSchemas {
+				for j, tab := range sch.DbSchemaTables {
+					for k, col := range tab.TableColumns {
+						field := c.toArrowField(col)
+						xdbcDataType := internal.ToXdbcDataType(field.Type)
+
+						if field.Type != nil {
+							getObjectsCatalog.CatalogDbSchemas[i].DbSchemaTables[j].TableColumns[k].XdbcDataType = driverbase.Nullable(int16(field.Type.ID()))
+						}
+						getObjectsCatalog.CatalogDbSchemas[i].DbSchemaTables[j].TableColumns[k].XdbcSqlDataType = driverbase.Nullable(int16(xdbcDataType))
+					}
+				}
+			}
+
+			catalogCh <- getObjectsCatalog
+		}
+	}()
+
+	return driverbase.BuildGetObjectsRecordReader(c.Alloc, catalogCh, errCh)
 }
 
-func (c *cnxn) getObjectsDbSchemas(ctx context.Context, depth adbc.ObjectDepth, catalog *string, dbSchema *string, metadataRecords []internal.Metadata) (result map[string][]string, err error) {
-	if depth == adbc.ObjectDepthCatalogs {
-		return
+// PrepareDriverInfo implements driverbase.DriverInfoPreparer.
+func (c *connectionImpl) PrepareDriverInfo(ctx context.Context, infoCodes []adbc.InfoCode) error {
+	if err := c.ConnectionImplBase.DriverInfo.RegisterInfoCode(adbc.InfoVendorSql, true); err != nil {
+		return err
+	}
+	return c.ConnectionImplBase.DriverInfo.RegisterInfoCode(adbc.InfoVendorSubstrait, false)
+}
+
+// ListTableTypes implements driverbase.TableTypeLister.
+func (*connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
+	return []string{"TABLE", "VIEW"}, nil
+}
+
+// GetCurrentCatalog implements driverbase.CurrentNamespacer.
+func (c *connectionImpl) GetCurrentCatalog() (string, error) {
+	return c.getStringQuery("SELECT CURRENT_DATABASE()")
+}
+
+// GetCurrentDbSchema implements driverbase.CurrentNamespacer.
+func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
+	return c.getStringQuery("SELECT CURRENT_SCHEMA()")
+}
+
+// SetCurrentCatalog implements driverbase.CurrentNamespacer.
+func (c *connectionImpl) SetCurrentCatalog(value string) error {
+	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE DATABASE %s;", quoteTblName(value)), nil)
+	return err
+}
+
+// SetCurrentDbSchema implements driverbase.CurrentNamespacer.
+func (c *connectionImpl) SetCurrentDbSchema(value string) error {
+	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE SCHEMA %s;", quoteTblName(value)), nil)
+	return err
+}
+
+// SetAutocommit implements driverbase.AutocommitSetter.
+func (c *connectionImpl) SetAutocommit(enabled bool) error {
+	if enabled {
+		if c.activeTransaction {
+			_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
+			if err != nil {
+				return errToAdbcErr(adbc.StatusInternal, err)
+			}
+			c.activeTransaction = false
+		}
+		_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = true", nil)
+		return err
 	}
 
-	result = make(map[string][]string)
-	uniqueCatalogSchema := make(map[string]map[string]bool)
-
-	for _, data := range metadataRecords {
-		if !data.Dbname.Valid || !data.Schema.Valid {
-			continue
+	if !c.activeTransaction {
+		_, err := c.cn.ExecContext(context.Background(), "BEGIN", nil)
+		if err != nil {
+			return errToAdbcErr(adbc.StatusInternal, err)
 		}
-
-		if _, exists := uniqueCatalogSchema[data.Dbname.String]; !exists {
-			uniqueCatalogSchema[data.Dbname.String] = make(map[string]bool)
-		}
-
-		cat, exists := result[data.Dbname.String]
-		if !exists {
-			cat = make([]string, 0, 1)
-		}
-
-		if _, exists := uniqueCatalogSchema[data.Dbname.String][data.Schema.String]; !exists {
-			result[data.Dbname.String] = append(cat, data.Schema.String)
-			uniqueCatalogSchema[data.Dbname.String][data.Schema.String] = true
-		}
+		c.activeTransaction = true
 	}
-
-	return
+	_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = false", nil)
+	return err
 }
 
 var loc = time.Now().Location()
 
-func toField(name string, isnullable bool, dataType string, numPrec, numPrecRadix, numScale sql.NullInt16, isIdent, useHighPrecision bool, identGen, identInc sql.NullString, charMaxLength, charOctetLength sql.NullInt32, datetimePrec sql.NullInt16, comment sql.NullString, ordinalPos int) (ret arrow.Field) {
-	ret.Name, ret.Nullable = name, isnullable
+func (c *connectionImpl) toArrowField(columnInfo driverbase.ColumnInfo) arrow.Field {
+	field := arrow.Field{Name: columnInfo.ColumnName, Nullable: driverbase.ValueOrZero(columnInfo.XdbcNullable) != 0}
 
-	switch dataType {
+	switch driverbase.ValueOrZero(columnInfo.XdbcTypeName) {
 	case "NUMBER":
-		if useHighPrecision {
-			ret.Type = &arrow.Decimal128Type{
-				Precision: int32(numPrec.Int16),
-				Scale:     int32(numScale.Int16),
+		if c.useHighPrecision {
+			field.Type = &arrow.Decimal128Type{
+				Precision: int32(driverbase.ValueOrZero(columnInfo.XdbcColumnSize)),
+				Scale:     int32(driverbase.ValueOrZero(columnInfo.XdbcDecimalDigits)),
 			}
 		} else {
-			if !numScale.Valid || numScale.Int16 == 0 {
-				ret.Type = arrow.PrimitiveTypes.Int64
+			if driverbase.ValueOrZero(columnInfo.XdbcDecimalDigits) == 0 {
+				field.Type = arrow.PrimitiveTypes.Int64
 			} else {
-				ret.Type = arrow.PrimitiveTypes.Float64
+				field.Type = arrow.PrimitiveTypes.Float64
 			}
 		}
 	case "FLOAT":
 		fallthrough
 	case "DOUBLE":
-		ret.Type = arrow.PrimitiveTypes.Float64
+		field.Type = arrow.PrimitiveTypes.Float64
 	case "TEXT":
-		ret.Type = arrow.BinaryTypes.String
+		field.Type = arrow.BinaryTypes.String
 	case "BINARY":
-		ret.Type = arrow.BinaryTypes.Binary
+		field.Type = arrow.BinaryTypes.Binary
 	case "BOOLEAN":
-		ret.Type = arrow.FixedWidthTypes.Boolean
+		field.Type = arrow.FixedWidthTypes.Boolean
 	case "ARRAY":
 		fallthrough
 	case "VARIANT":
 		fallthrough
 	case "OBJECT":
 		// snowflake will return each value as a string
-		ret.Type = arrow.BinaryTypes.String
+		field.Type = arrow.BinaryTypes.String
 	case "DATE":
-		ret.Type = arrow.FixedWidthTypes.Date32
+		field.Type = arrow.FixedWidthTypes.Date32
 	case "TIME":
-		ret.Type = arrow.FixedWidthTypes.Time64ns
+		field.Type = arrow.FixedWidthTypes.Time64ns
 	case "DATETIME":
 		fallthrough
 	case "TIMESTAMP", "TIMESTAMP_NTZ":
-		ret.Type = &arrow.TimestampType{Unit: arrow.Nanosecond}
+		field.Type = &arrow.TimestampType{Unit: arrow.Nanosecond}
 	case "TIMESTAMP_LTZ":
-		ret.Type = &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: loc.String()}
+		field.Type = &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: loc.String()}
 	case "TIMESTAMP_TZ":
-		ret.Type = arrow.FixedWidthTypes.Timestamp_ns
+		field.Type = arrow.FixedWidthTypes.Timestamp_ns
 	case "GEOGRAPHY":
 		fallthrough
 	case "GEOMETRY":
-		ret.Type = arrow.BinaryTypes.String
+		field.Type = arrow.BinaryTypes.String
+	case "VECTOR":
+		// despite the fact that Snowflake *does* support returning data
+		// for VECTOR typed columns as Arrow FixedSizeLists, there's no way
+		// currently to retrieve enough metadata to construct the proper type
+		// for it
 	}
 
-	md := make(map[string]string)
-	md["TYPE_NAME"] = dataType
-	if isIdent {
-		md["IS_IDENTITY"] = "YES"
-		md["IDENTITY_GENERATION"] = identGen.String
-		md["IDENTITY_INCREMENT"] = identInc.String
-	}
-	if comment.Valid {
-		md["COMMENT"] = comment.String
-	}
-
-	md["ORDINAL_POSITION"] = strconv.Itoa(ordinalPos)
-	md["XDBC_DATA_TYPE"] = strconv.Itoa(int(ret.Type.ID()))
-	md["XDBC_TYPE_NAME"] = dataType
-	md["XDBC_SQL_DATA_TYPE"] = strconv.Itoa(int(toXdbcDataType(ret.Type)))
-	md["XDBC_NULLABLE"] = strconv.FormatBool(isnullable)
-
-	if isnullable {
-		md["XDBC_IS_NULLABLE"] = "YES"
-	} else {
-		md["XDBC_IS_NULLABLE"] = "NO"
-	}
-
-	if numPrec.Valid {
-		md["XDBC_PRECISION"] = strconv.Itoa(int(numPrec.Int16))
-	}
-
-	if numScale.Valid {
-		md["XDBC_SCALE"] = strconv.Itoa(int(numScale.Int16))
-	}
-
-	if numPrec.Valid {
-		md["XDBC_PRECISION"] = strconv.Itoa(int(numPrec.Int16))
-	}
-
-	if numPrecRadix.Valid {
-		md["XDBC_NUM_PREC_RADIX"] = strconv.Itoa(int(numPrecRadix.Int16))
-	}
-
-	if charMaxLength.Valid {
-		md["CHARACTER_MAXIMUM_LENGTH"] = strconv.Itoa(int(charMaxLength.Int32))
-	}
-
-	if charOctetLength.Valid {
-		md["XDBC_CHAR_OCTET_LENGTH"] = strconv.Itoa(int(charOctetLength.Int32))
-	}
-
-	if datetimePrec.Valid {
-		md["XDBC_DATETIME_SUB"] = strconv.Itoa(int(datetimePrec.Int16))
-	}
-
-	ret.Metadata = arrow.MetadataFrom(md)
-
-	return
-}
-
-func toXdbcDataType(dt arrow.DataType) (xdbcType internal.XdbcDataType) {
-	xdbcType = internal.XdbcDataType_XDBC_UNKNOWN_TYPE
-	switch dt.ID() {
-	case arrow.EXTENSION:
-		return toXdbcDataType(dt.(arrow.ExtensionType).StorageType())
-	case arrow.DICTIONARY:
-		return toXdbcDataType(dt.(*arrow.DictionaryType).ValueType)
-	case arrow.RUN_END_ENCODED:
-		return toXdbcDataType(dt.(*arrow.RunEndEncodedType).Encoded())
-	case arrow.INT8, arrow.UINT8:
-		return internal.XdbcDataType_XDBC_TINYINT
-	case arrow.INT16, arrow.UINT16:
-		return internal.XdbcDataType_XDBC_SMALLINT
-	case arrow.INT32, arrow.UINT32:
-		return internal.XdbcDataType_XDBC_SMALLINT
-	case arrow.INT64, arrow.UINT64:
-		return internal.XdbcDataType_XDBC_BIGINT
-	case arrow.FLOAT32, arrow.FLOAT16, arrow.FLOAT64:
-		return internal.XdbcDataType_XDBC_FLOAT
-	case arrow.DECIMAL, arrow.DECIMAL256:
-		return internal.XdbcDataType_XDBC_DECIMAL
-	case arrow.STRING, arrow.LARGE_STRING:
-		return internal.XdbcDataType_XDBC_VARCHAR
-	case arrow.BINARY, arrow.LARGE_BINARY:
-		return internal.XdbcDataType_XDBC_BINARY
-	case arrow.FIXED_SIZE_BINARY:
-		return internal.XdbcDataType_XDBC_BINARY
-	case arrow.BOOL:
-		return internal.XdbcDataType_XDBC_BIT
-	case arrow.TIME32, arrow.TIME64:
-		return internal.XdbcDataType_XDBC_TIME
-	case arrow.DATE32, arrow.DATE64:
-		return internal.XdbcDataType_XDBC_DATE
-	case arrow.TIMESTAMP:
-		return internal.XdbcDataType_XDBC_TIMESTAMP
-	case arrow.DENSE_UNION, arrow.SPARSE_UNION:
-		return internal.XdbcDataType_XDBC_VARBINARY
-	case arrow.LIST, arrow.LARGE_LIST, arrow.FIXED_SIZE_LIST:
-		return internal.XdbcDataType_XDBC_VARBINARY
-	case arrow.STRUCT, arrow.MAP:
-		return internal.XdbcDataType_XDBC_VARBINARY
-	default:
-		return internal.XdbcDataType_XDBC_UNKNOWN_TYPE
-	}
-}
-
-func (c *cnxn) getObjectsTables(ctx context.Context, depth adbc.ObjectDepth, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string, metadataRecords []internal.Metadata) (result internal.SchemaToTableInfo, err error) {
-	if depth == adbc.ObjectDepthCatalogs || depth == adbc.ObjectDepthDBSchemas {
-		return
-	}
-
-	result = make(internal.SchemaToTableInfo)
-	includeSchema := depth == adbc.ObjectDepthAll || depth == adbc.ObjectDepthColumns
-
-	uniqueCatalogSchemaTable := make(map[string]map[string]map[string]bool)
-	for _, data := range metadataRecords {
-		if !data.Dbname.Valid || !data.Schema.Valid || !data.TblName.Valid || !data.TblType.Valid {
-			continue
-		}
-
-		if _, exists := uniqueCatalogSchemaTable[data.Dbname.String]; !exists {
-			uniqueCatalogSchemaTable[data.Dbname.String] = make(map[string]map[string]bool)
-		}
-
-		if _, exists := uniqueCatalogSchemaTable[data.Dbname.String][data.Schema.String]; !exists {
-			uniqueCatalogSchemaTable[data.Dbname.String][data.Schema.String] = make(map[string]bool)
-		}
-
-		if _, exists := uniqueCatalogSchemaTable[data.Dbname.String][data.Schema.String][data.TblName.String]; !exists {
-			uniqueCatalogSchemaTable[data.Dbname.String][data.Schema.String][data.TblName.String] = true
-
-			key := internal.CatalogAndSchema{
-				Catalog: data.Dbname.String, Schema: data.Schema.String}
-
-			result[key] = append(result[key], internal.TableInfo{
-				Name: data.TblName.String, TableType: data.TblType.String})
-		}
-	}
-
-	if includeSchema {
-		var (
-			prevKey      internal.CatalogAndSchema
-			curTableInfo *internal.TableInfo
-			fieldList    = make([]arrow.Field, 0)
-		)
-
-		for _, data := range metadataRecords {
-			if !data.Dbname.Valid || !data.Schema.Valid || !data.TblName.Valid {
-				continue
-			}
-
-			key := internal.CatalogAndSchema{Catalog: data.Dbname.String, Schema: data.Schema.String}
-			if prevKey != key || (curTableInfo != nil && curTableInfo.Name != data.TblName.String) {
-				if len(fieldList) > 0 && curTableInfo != nil {
-					curTableInfo.Schema = arrow.NewSchema(fieldList, nil)
-					fieldList = fieldList[:0]
-				}
-
-				info := result[key]
-				for i := range info {
-					if info[i].Name == data.TblName.String {
-						curTableInfo = &info[i]
-						break
-					}
-				}
-			}
-
-			prevKey = key
-			fieldList = append(fieldList, toField(data.ColName, data.IsNullable, data.DataType, data.NumericPrec, data.NumericPrecRadix, data.NumericScale, data.IsIdent, c.useHighPrecision, data.IdentGen, data.IdentIncrement, data.CharMaxLength, data.CharOctetLength, data.DatetimePrec, data.Comment, data.OrdinalPos))
-		}
-
-		if len(fieldList) > 0 && curTableInfo != nil {
-			curTableInfo.Schema = arrow.NewSchema(fieldList, nil)
-		}
-	}
-	return
-}
-
-func (c *cnxn) populateMetadata(ctx context.Context, depth adbc.ObjectDepth, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) ([]internal.Metadata, error) {
-	var metadataRecords []internal.Metadata
-	catalogMetadataRecords, err := c.getCatalogsMetadata(ctx)
-	if err != nil {
-		return nil, errToAdbcErr(adbc.StatusIO, err)
-	}
-
-	matchingCatalogNames, err := getMatchingCatalogNames(catalogMetadataRecords, catalog)
-	if err != nil {
-		return nil, adbc.Error{
-			Msg:  err.Error(),
-			Code: adbc.StatusInvalidArgument,
-		}
-	}
-
-	if depth == adbc.ObjectDepthCatalogs {
-		metadataRecords = catalogMetadataRecords
-	} else if depth == adbc.ObjectDepthDBSchemas {
-		metadataRecords, err = c.getDbSchemasMetadata(ctx, matchingCatalogNames, catalog, dbSchema)
-	} else if depth == adbc.ObjectDepthTables {
-		metadataRecords, err = c.getTablesMetadata(ctx, matchingCatalogNames, catalog, dbSchema, tableName, tableType)
-	} else {
-		metadataRecords, err = c.getColumnsMetadata(ctx, matchingCatalogNames, catalog, dbSchema, tableName, columnName, tableType)
-	}
-
-	if err != nil {
-		return nil, errToAdbcErr(adbc.StatusIO, err)
-	}
-
-	return metadataRecords, nil
-}
-
-func (c *cnxn) getCatalogsMetadata(ctx context.Context) ([]internal.Metadata, error) {
-	metadataRecords := make([]internal.Metadata, 0)
-
-	rows, err := c.sqldb.QueryContext(ctx, prepareCatalogsSQL(), nil)
-	if err != nil {
-		return nil, errToAdbcErr(adbc.StatusIO, err)
-	}
-
-	for rows.Next() {
-		var data internal.Metadata
-		var skipDbNullField, skipSchemaNullField sql.NullString
-		// schema for SHOW TERSE DATABASES is:
-		// created_on:timestamp, name:text, kind:null, database_name:null, schema_name:null
-		// the last three columns are always null because they are not applicable for databases
-		// so we want values[1].(string) for the name
-		if err := rows.Scan(&data.Created, &data.Dbname, &data.Kind, &skipDbNullField, &skipSchemaNullField); err != nil {
-			return nil, errToAdbcErr(adbc.StatusInvalidData, err)
-		}
-
-		// SNOWFLAKE catalog contains functions and no tables
-		if data.Dbname.Valid && data.Dbname.String == "SNOWFLAKE" {
-			continue
-		}
-
-		metadataRecords = append(metadataRecords, data)
-	}
-	return metadataRecords, nil
-}
-
-func (c *cnxn) getDbSchemasMetadata(ctx context.Context, matchingCatalogNames []string, catalog *string, dbSchema *string) ([]internal.Metadata, error) {
-	var metadataRecords []internal.Metadata
-	query, queryArgs := prepareDbSchemasSQL(matchingCatalogNames, catalog, dbSchema)
-	rows, err := c.sqldb.QueryContext(ctx, query, queryArgs...)
-	if err != nil {
-		return nil, errToAdbcErr(adbc.StatusIO, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var data internal.Metadata
-		if err = rows.Scan(&data.Dbname, &data.Schema); err != nil {
-			return nil, errToAdbcErr(adbc.StatusIO, err)
-		}
-		metadataRecords = append(metadataRecords, data)
-	}
-	return metadataRecords, nil
-}
-
-func (c *cnxn) getTablesMetadata(ctx context.Context, matchingCatalogNames []string, catalog *string, dbSchema *string, tableName *string, tableType []string) ([]internal.Metadata, error) {
-	metadataRecords := make([]internal.Metadata, 0)
-	query, queryArgs := prepareTablesSQL(matchingCatalogNames, catalog, dbSchema, tableName, tableType)
-	rows, err := c.sqldb.QueryContext(ctx, query, queryArgs...)
-	if err != nil {
-		return nil, errToAdbcErr(adbc.StatusIO, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var data internal.Metadata
-		if err = rows.Scan(&data.Dbname, &data.Schema, &data.TblName, &data.TblType); err != nil {
-			return nil, errToAdbcErr(adbc.StatusIO, err)
-		}
-		metadataRecords = append(metadataRecords, data)
-	}
-	return metadataRecords, nil
-}
-
-func (c *cnxn) getColumnsMetadata(ctx context.Context, matchingCatalogNames []string, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) ([]internal.Metadata, error) {
-	metadataRecords := make([]internal.Metadata, 0)
-	query, queryArgs := prepareColumnsSQL(matchingCatalogNames, catalog, dbSchema, tableName, columnName, tableType)
-	rows, err := c.sqldb.QueryContext(ctx, query, queryArgs...)
-	if err != nil {
-		return nil, errToAdbcErr(adbc.StatusIO, err)
-	}
-	defer rows.Close()
-
-	var data internal.Metadata
-
-	for rows.Next() {
-		// order here matches the order of the columns requested in the query
-		err = rows.Scan(&data.TblType, &data.Dbname, &data.Schema, &data.TblName, &data.ColName,
-			&data.OrdinalPos, &data.IsNullable, &data.DataType, &data.NumericPrec,
-			&data.NumericPrecRadix, &data.NumericScale, &data.IsIdent, &data.IdentGen,
-			&data.IdentIncrement, &data.CharMaxLength, &data.CharOctetLength, &data.DatetimePrec, &data.Comment)
-		if err != nil {
-			return nil, errToAdbcErr(adbc.StatusIO, err)
-		}
-		metadataRecords = append(metadataRecords, data)
-	}
-	return metadataRecords, nil
-}
-
-func getMatchingCatalogNames(metadataRecords []internal.Metadata, catalog *string) ([]string, error) {
-	matchingCatalogNames := make([]string, 0)
-	var catalogPattern *regexp.Regexp
-	var err error
-	if catalogPattern, err = internal.PatternToRegexp(catalog); err != nil {
-		return nil, adbc.Error{
-			Msg:  err.Error(),
-			Code: adbc.StatusInvalidArgument,
-		}
-	}
-
-	for _, data := range metadataRecords {
-		if data.Dbname.Valid && data.Dbname.String == "SNOWFLAKE" {
-			continue
-		}
-		if catalogPattern != nil && !catalogPattern.MatchString(data.Dbname.String) {
-			continue
-		}
-
-		matchingCatalogNames = append(matchingCatalogNames, data.Dbname.String)
-	}
-	return matchingCatalogNames, nil
-}
-
-func prepareCatalogsSQL() string {
-	return "SHOW TERSE DATABASES"
-}
-
-func prepareDbSchemasSQL(matchingCatalogNames []string, catalog *string, dbSchema *string) (string, []interface{}) {
-	query := ""
-	for _, catalog_name := range matchingCatalogNames {
-		if query != "" {
-			query += " UNION ALL "
-		}
-		query += `SELECT * FROM "` + strings.ReplaceAll(catalog_name, "\"", "\"\"") + `".INFORMATION_SCHEMA.SCHEMATA`
-	}
-
-	query = `SELECT CATALOG_NAME, SCHEMA_NAME FROM (` + query + `)`
-	conditions, queryArgs := prepareFilterConditions(adbc.ObjectDepthDBSchemas, catalog, dbSchema, nil, nil, make([]string, 0))
-	if conditions != "" {
-		query += " WHERE " + conditions
-	}
-
-	return query, queryArgs
-}
-
-func prepareTablesSQL(matchingCatalogNames []string, catalog *string, dbSchema *string, tableName *string, tableType []string) (string, []interface{}) {
-	query := ""
-	for _, catalog_name := range matchingCatalogNames {
-		if query != "" {
-			query += " UNION ALL "
-		}
-		query += `SELECT * FROM "` + strings.ReplaceAll(catalog_name, "\"", "\"\"") + `".INFORMATION_SCHEMA.TABLES`
-	}
-
-	query = `SELECT table_catalog, table_schema, table_name, table_type FROM (` + query + `)`
-	conditions, queryArgs := prepareFilterConditions(adbc.ObjectDepthTables, catalog, dbSchema, tableName, nil, tableType)
-	if conditions != "" {
-		query += " WHERE " + conditions
-	}
-	return query, queryArgs
-}
-
-func prepareColumnsSQL(matchingCatalogNames []string, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) (string, []interface{}) {
-	prefixQuery := ""
-	for _, catalogName := range matchingCatalogNames {
-		if prefixQuery != "" {
-			prefixQuery += " UNION ALL "
-		}
-		prefixQuery += `SELECT T.table_type,
-					C.*
-				FROM
-				"` + strings.ReplaceAll(catalogName, "\"", "\"\"") + `".INFORMATION_SCHEMA.TABLES AS T
-			JOIN
-				"` + strings.ReplaceAll(catalogName, "\"", "\"\"") + `".INFORMATION_SCHEMA.COLUMNS AS C
-			ON
-				T.table_catalog = C.table_catalog
-				AND T.table_schema = C.table_schema
-				AND t.table_name = C.table_name`
-	}
-
-	prefixQuery = `SELECT table_type, table_catalog, table_schema, table_name, column_name,
-						ordinal_position, is_nullable::boolean, data_type, numeric_precision,
-						numeric_precision_radix, numeric_scale, is_identity::boolean,
-						identity_generation, identity_increment,
-						character_maximum_length, character_octet_length, datetime_precision, comment FROM (` + prefixQuery + `)`
-	ordering := ` ORDER BY table_catalog, table_schema, table_name, ordinal_position`
-	conditions, queryArgs := prepareFilterConditions(adbc.ObjectDepthColumns, catalog, dbSchema, tableName, columnName, tableType)
-	query := prefixQuery
-
-	if conditions != "" {
-		query += " WHERE " + conditions
-	}
-
-	query += ordering
-	return query, queryArgs
-}
-
-func prepareFilterConditions(depth adbc.ObjectDepth, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) (string, []interface{}) {
-	conditions := make([]string, 0)
-	queryArgs := make([]interface{}, 0)
-	if catalog != nil && *catalog != "" {
-		if depth == adbc.ObjectDepthDBSchemas {
-			conditions = append(conditions, ` CATALOG_NAME ILIKE ? `)
-		} else {
-			conditions = append(conditions, ` TABLE_CATALOG ILIKE ? `)
-		}
-		queryArgs = append(queryArgs, *catalog)
-	}
-	if dbSchema != nil && *dbSchema != "" {
-		if depth == adbc.ObjectDepthDBSchemas {
-			conditions = append(conditions, ` SCHEMA_NAME ILIKE ? `)
-		} else {
-			conditions = append(conditions, ` TABLE_SCHEMA ILIKE ? `)
-		}
-		queryArgs = append(queryArgs, *dbSchema)
-	}
-	if tableName != nil && *tableName != "" {
-		conditions = append(conditions, ` TABLE_NAME ILIKE ? `)
-		queryArgs = append(queryArgs, *tableName)
-	}
-	if columnName != nil && *columnName != "" {
-		conditions = append(conditions, ` COLUMN_NAME ILIKE ? `)
-		queryArgs = append(queryArgs, *columnName)
-	}
-
-	var tblConditions []string
-	if len(tableType) > 0 {
-		tblConditions = append(conditions, ` TABLE_TYPE IN ('`+strings.Join(tableType, `','`)+`')`)
-	} else {
-		tblConditions = conditions
-	}
-
-	cond := strings.Join(tblConditions, " AND ")
-	return cond, queryArgs
+	return field
 }
 
 func descToField(name, typ, isnull, primary string, comment sql.NullString) (field arrow.Field, err error) {
@@ -871,29 +572,7 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString) (fie
 	return
 }
 
-func (c *cnxn) GetOption(key string) (string, error) {
-	switch key {
-	case adbc.OptionKeyAutoCommit:
-		if c.activeTransaction {
-			// No autocommit
-			return adbc.OptionValueDisabled, nil
-		} else {
-			// Autocommit
-			return adbc.OptionValueEnabled, nil
-		}
-	case adbc.OptionKeyCurrentCatalog:
-		return c.getStringQuery("SELECT CURRENT_DATABASE()")
-	case adbc.OptionKeyCurrentDbSchema:
-		return c.getStringQuery("SELECT CURRENT_SCHEMA()")
-	}
-
-	return "", adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotFound,
-	}
-}
-
-func (c *cnxn) getStringQuery(query string) (string, error) {
+func (c *connectionImpl) getStringQuery(query string) (string, error) {
 	result, err := c.cn.QueryContext(context.Background(), query, nil)
 	if err != nil {
 		return "", errToAdbcErr(adbc.StatusInternal, err)
@@ -929,54 +608,45 @@ func (c *cnxn) getStringQuery(query string) (string, error) {
 	return value, nil
 }
 
-func (c *cnxn) GetOptionBytes(key string) ([]byte, error) {
-	return nil, adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotFound,
-	}
-}
-
-func (c *cnxn) GetOptionInt(key string) (int64, error) {
-	return 0, adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotFound,
-	}
-}
-
-func (c *cnxn) GetOptionDouble(key string) (float64, error) {
-	return 0.0, adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotFound,
-	}
-}
-
-func (c *cnxn) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (*arrow.Schema, error) {
+func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (*arrow.Schema, error) {
 	tblParts := make([]string, 0, 3)
 	if catalog != nil {
-		tblParts = append(tblParts, strconv.Quote(*catalog))
+		tblParts = append(tblParts, quoteTblName(*catalog))
 	}
 	if dbSchema != nil {
-		tblParts = append(tblParts, strconv.Quote(*dbSchema))
+		tblParts = append(tblParts, quoteTblName(*dbSchema))
 	}
-	tblParts = append(tblParts, strconv.Quote(tableName))
+	tblParts = append(tblParts, quoteTblName(tableName))
 	fullyQualifiedTable := strings.Join(tblParts, ".")
 
-	rows, err := c.sqldb.QueryContext(ctx, `DESC TABLE `+fullyQualifiedTable)
+	rows, err := c.cn.QueryContext(ctx, `DESC TABLE `+fullyQualifiedTable, nil)
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusIO, err)
 	}
 	defer rows.Close()
 
 	var (
-		name, typ, kind, isnull, primary, unique string
-		def, check, expr, comment, policyName    sql.NullString
-		fields                                   = []arrow.Field{}
+		name, typ, isnull, primary string
+		comment                    sql.NullString
+		fields                     = []arrow.Field{}
 	)
 
-	for rows.Next() {
-		err := rows.Scan(&name, &typ, &kind, &isnull, &def, &primary, &unique,
-			&check, &expr, &comment, &policyName)
-		if err != nil {
+	// columns are:
+	// name, type, kind, isnull, primary, unique, def, check, expr, comment, policyName, privDomain
+	dest := make([]driver.Value, len(rows.Columns()))
+	for {
+		if err := rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, errToAdbcErr(adbc.StatusIO, err)
+		}
+
+		name = dest[0].(string)
+		typ = dest[1].(string)
+		isnull = dest[3].(string)
+		primary = dest[5].(string)
+		if err := comment.Scan(dest[9]); err != nil {
 			return nil, errToAdbcErr(adbc.StatusIO, err)
 		}
 
@@ -991,35 +661,11 @@ func (c *cnxn) GetTableSchema(ctx context.Context, catalog *string, dbSchema *st
 	return sc, nil
 }
 
-// GetTableTypes returns a list of the table types in the database.
-//
-// The result is an arrow dataset with the following schema:
-//
-//	Field Name			| Field Type
-//	----------------|--------------
-//	table_type			| utf8 not null
-func (c *cnxn) GetTableTypes(_ context.Context) (array.RecordReader, error) {
-	bldr := array.NewRecordBuilder(c.db.Alloc, adbc.TableTypesSchema)
-	defer bldr.Release()
-
-	bldr.Field(0).(*array.StringBuilder).AppendValues([]string{"BASE TABLE", "TEMPORARY TABLE", "VIEW"}, nil)
-	final := bldr.NewRecord()
-	defer final.Release()
-	return array.NewRecordReader(adbc.TableTypesSchema, []arrow.Record{final})
-}
-
 // Commit commits any pending transactions on this connection, it should
 // only be used if autocommit is disabled.
 //
 // Behavior is undefined if this is mixed with SQL transaction statements.
-func (c *cnxn) Commit(_ context.Context) error {
-	if !c.activeTransaction {
-		return adbc.Error{
-			Msg:  "no active transaction, cannot commit",
-			Code: adbc.StatusInvalidState,
-		}
-	}
-
+func (c *connectionImpl) Commit(_ context.Context) error {
 	_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusInternal, err)
@@ -1033,14 +679,7 @@ func (c *cnxn) Commit(_ context.Context) error {
 // is disabled.
 //
 // Behavior is undefined if this is mixed with SQL transaction statements.
-func (c *cnxn) Rollback(_ context.Context) error {
-	if !c.activeTransaction {
-		return adbc.Error{
-			Msg:  "no active transaction, cannot rollback",
-			Code: adbc.StatusInvalidState,
-		}
-	}
-
+func (c *connectionImpl) Rollback(_ context.Context) error {
 	_, err := c.cn.ExecContext(context.Background(), "ROLLBACK", nil)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusInternal, err)
@@ -1051,7 +690,7 @@ func (c *cnxn) Rollback(_ context.Context) error {
 }
 
 // NewStatement initializes a new statement object tied to this connection
-func (c *cnxn) NewStatement() (adbc.Statement, error) {
+func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 	defaultIngestOptions := DefaultIngestOptions()
 	return &statement{
 		alloc:               c.db.Alloc,
@@ -1064,15 +703,10 @@ func (c *cnxn) NewStatement() (adbc.Statement, error) {
 }
 
 // Close closes this connection and releases any associated resources.
-func (c *cnxn) Close() error {
-	if c.sqldb == nil || c.cn == nil {
+func (c *connectionImpl) Close() error {
+	if c.cn == nil {
 		return adbc.Error{Code: adbc.StatusInvalidState}
 	}
-
-	if err := c.sqldb.Close(); err != nil {
-		return err
-	}
-	c.sqldb = nil
 
 	defer func() {
 		c.cn = nil
@@ -1084,49 +718,15 @@ func (c *cnxn) Close() error {
 // results can then be read independently using the returned RecordReader.
 //
 // A partition can be retrieved by using ExecutePartitions on a statement.
-func (c *cnxn) ReadPartition(ctx context.Context, serializedPartition []byte) (array.RecordReader, error) {
+func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition []byte) (array.RecordReader, error) {
 	return nil, adbc.Error{
 		Code: adbc.StatusNotImplemented,
 		Msg:  "ReadPartition not yet implemented for snowflake driver",
 	}
 }
 
-func (c *cnxn) SetOption(key, value string) error {
+func (c *connectionImpl) SetOption(key, value string) error {
 	switch key {
-	case adbc.OptionKeyAutoCommit:
-		switch value {
-		case adbc.OptionValueEnabled:
-			if c.activeTransaction {
-				_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
-				if err != nil {
-					return errToAdbcErr(adbc.StatusInternal, err)
-				}
-				c.activeTransaction = false
-			}
-			_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = true", nil)
-			return err
-		case adbc.OptionValueDisabled:
-			if !c.activeTransaction {
-				_, err := c.cn.ExecContext(context.Background(), "BEGIN", nil)
-				if err != nil {
-					return errToAdbcErr(adbc.StatusInternal, err)
-				}
-				c.activeTransaction = true
-			}
-			_, err := c.cn.ExecContext(context.Background(), "ALTER SESSION SET AUTOCOMMIT = false", nil)
-			return err
-		default:
-			return adbc.Error{
-				Msg:  "[Snowflake] invalid value for option " + key + ": " + value,
-				Code: adbc.StatusInvalidArgument,
-			}
-		}
-	case adbc.OptionKeyCurrentCatalog:
-		_, err := c.cn.ExecContext(context.Background(), "USE DATABASE ?", []driver.NamedValue{{Value: value}})
-		return err
-	case adbc.OptionKeyCurrentDbSchema:
-		_, err := c.cn.ExecContext(context.Background(), "USE SCHEMA ?", []driver.NamedValue{{Value: value}})
-		return err
 	case OptionUseHighPrecision:
 		// statements will inherit the value of the OptionUseHighPrecision
 		// from the connection, but the option can be overridden at the
@@ -1148,26 +748,5 @@ func (c *cnxn) SetOption(key, value string) error {
 			Msg:  "[Snowflake] unknown connection option " + key + ": " + value,
 			Code: adbc.StatusInvalidArgument,
 		}
-	}
-}
-
-func (c *cnxn) SetOptionBytes(key string, value []byte) error {
-	return adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotImplemented,
-	}
-}
-
-func (c *cnxn) SetOptionInt(key string, value int64) error {
-	return adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotImplemented,
-	}
-}
-
-func (c *cnxn) SetOptionDouble(key string, value float64) error {
-	return adbc.Error{
-		Msg:  "[Snowflake] unknown connection option",
-		Code: adbc.StatusNotImplemented,
 	}
 }
