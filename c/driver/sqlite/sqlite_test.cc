@@ -20,8 +20,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest-matchers.h>
 #include <gtest/gtest-param-test.h>
@@ -79,10 +81,16 @@ class SqliteQuirks : public adbc_validation::DriverQuirks {
       case NANOARROW_TYPE_UINT32:
       case NANOARROW_TYPE_UINT64:
         return NANOARROW_TYPE_INT64;
+      case NANOARROW_TYPE_HALF_FLOAT:
       case NANOARROW_TYPE_FLOAT:
-      case NANOARROW_TYPE_DOUBLE:
         return NANOARROW_TYPE_DOUBLE;
       case NANOARROW_TYPE_LARGE_STRING:
+      case NANOARROW_TYPE_STRING_VIEW:
+        return NANOARROW_TYPE_STRING;
+      case NANOARROW_TYPE_LARGE_BINARY:
+      case NANOARROW_TYPE_FIXED_SIZE_BINARY:
+      case NANOARROW_TYPE_BINARY_VIEW:
+        return NANOARROW_TYPE_BINARY;
       case NANOARROW_TYPE_DATE32:
       case NANOARROW_TYPE_TIMESTAMP:
         return NANOARROW_TYPE_STRING;
@@ -132,14 +140,13 @@ class SqliteQuirks : public adbc_validation::DriverQuirks {
     return ddl;
   }
 
-  bool supports_bulk_ingest(const char* mode) const override {
-    return std::strcmp(mode, ADBC_INGEST_OPTION_MODE_APPEND) == 0 ||
-           std::strcmp(mode, ADBC_INGEST_OPTION_MODE_CREATE) == 0;
-  }
+  bool supports_bulk_ingest(const char* mode) const override { return true; }
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_temporary() const override { return true; }
   bool supports_concurrent_statements() const override { return true; }
-  bool supports_get_option() const override { return false; }
+  bool supports_metadata_current_catalog() const override { return true; }
+  bool supports_metadata_current_db_schema() const override { return false; }
+  bool supports_get_option() const override { return true; }
   std::optional<adbc_validation::SqlInfoValue> supports_get_sql_info(
       uint32_t info_code) const override {
     switch (info_code) {
@@ -184,6 +191,10 @@ class SqliteConnectionTest : public ::testing::Test,
 ADBCV_TEST_CONNECTION(SqliteConnectionTest)
 
 TEST_F(SqliteConnectionTest, ExtensionLoading) {
+#if defined(ADBC_SQLITE_WITH_NO_LOAD_EXTENSION)
+  GTEST_SKIP() << "Linking to SQLite without extension loading";
+#endif
+
   ASSERT_THAT(AdbcConnectionNew(&connection, &error),
               adbc_validation::IsOkStatus(&error));
 
@@ -325,6 +336,12 @@ class SqliteStatementTest : public ::testing::Test,
   void TestSqlIngestInterval() {
     GTEST_SKIP() << "Cannot ingest Interval (not implemented)";
   }
+  void TestSqlIngestListOfInt32() {
+    GTEST_SKIP() << "Cannot ingest list<int32> (not implemented)";
+  }
+  void TestSqlIngestListOfString() {
+    GTEST_SKIP() << "Cannot ingest list<string> (not implemented)";
+  }
 
  protected:
   void ValidateIngestedTemporalData(struct ArrowArrayView* values, ArrowType type,
@@ -428,16 +445,21 @@ class SqliteReaderTest : public ::testing::Test {
   }
 
   void Exec(const std::string& query) {
-    ASSERT_EQ(SQLITE_OK, sqlite3_prepare_v2(db, query.c_str(), query.size(), &stmt,
-                                            /*pzTail=*/nullptr));
+    SCOPED_TRACE(query);
+    int rc = sqlite3_prepare_v2(db, query.c_str(), query.size(), &stmt,
+                                /*pzTail=*/nullptr);
+    ASSERT_EQ(SQLITE_OK, rc) << "Failed to prepare query: " << sqlite3_errmsg(db);
     ASSERT_EQ(SQLITE_DONE, sqlite3_step(stmt));
     sqlite3_finalize(stmt);
     stmt = nullptr;
   }
 
   void Bind(struct ArrowArray* batch, struct ArrowSchema* schema) {
-    ASSERT_THAT(AdbcSqliteBinderSetArray(&binder, batch, schema, &error),
-                IsOkStatus(&error));
+    Handle<struct ArrowArrayStream> stream;
+    struct ArrowArray batch_internal = *batch;
+    batch->release = nullptr;
+    adbc_validation::MakeStream(&stream.value, schema, {batch_internal});
+    ASSERT_NO_FATAL_FAILURE(Bind(&stream.value));
   }
 
   void Bind(struct ArrowArrayStream* stream) {
@@ -508,7 +530,7 @@ TEST_F(SqliteReaderTest, IntsFloatsNulls) {
 TEST_F(SqliteReaderTest, IntsNullsStrsNullsInts) {
   adbc_validation::StreamReader reader;
   ASSERT_NO_FATAL_FAILURE(ExecSelect(
-      R"((NULL), (1), (NULL), (-1), ("foo"), (NULL), (""), (24))", kInferRows, &reader));
+      R"((NULL), (1), (NULL), (-1), ('foo'), (NULL), (''), (24))", kInferRows, &reader));
   ASSERT_EQ(NANOARROW_TYPE_STRING, reader.fields[0].type);
 
   ASSERT_NO_FATAL_FAILURE(reader.Next());
@@ -534,7 +556,7 @@ TEST_F(SqliteReaderTest, IntExtremes) {
 TEST_F(SqliteReaderTest, IntExtremesStrs) {
   adbc_validation::StreamReader reader;
   ASSERT_NO_FATAL_FAILURE(ExecSelect(
-      R"((NULL), (9223372036854775807), (-9223372036854775808), (""), (9223372036854775807), (-9223372036854775808))",
+      R"((NULL), (9223372036854775807), (-9223372036854775808), (''), (9223372036854775807), (-9223372036854775808))",
       kInferRows, &reader));
   ASSERT_EQ(NANOARROW_TYPE_STRING, reader.fields[0].type);
 
@@ -569,7 +591,7 @@ TEST_F(SqliteReaderTest, FloatExtremes) {
 TEST_F(SqliteReaderTest, IntsFloatsStrs) {
   adbc_validation::StreamReader reader;
   ASSERT_NO_FATAL_FAILURE(
-      ExecSelect(R"((1), (1.0), (""), (9e999), (-9e999))", kInferRows, &reader));
+      ExecSelect(R"((1), (1.0), (''), (9e999), (-9e999))", kInferRows, &reader));
   ASSERT_EQ(NANOARROW_TYPE_STRING, reader.fields[0].type);
 
   ASSERT_NO_FATAL_FAILURE(reader.Next());
@@ -611,7 +633,7 @@ TEST_F(SqliteReaderTest, InferIntRejectFloat) {
 TEST_F(SqliteReaderTest, InferIntRejectStr) {
   adbc_validation::StreamReader reader;
   ASSERT_NO_FATAL_FAILURE(
-      ExecSelect(R"((1), (NULL), (""), (NULL))", /*infer_rows=*/2, &reader));
+      ExecSelect(R"((1), (NULL), (''), (NULL))", /*infer_rows=*/2, &reader));
   ASSERT_EQ(NANOARROW_TYPE_INT64, reader.fields[0].type);
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_NO_FATAL_FAILURE(
@@ -660,7 +682,7 @@ TEST_F(SqliteReaderTest, InferFloatReadIntFloat) {
 
 TEST_F(SqliteReaderTest, InferFloatRejectStr) {
   adbc_validation::StreamReader reader;
-  ASSERT_NO_FATAL_FAILURE(ExecSelect(R"((1E0), (NULL), (2E0), (3), (""), (NULL))",
+  ASSERT_NO_FATAL_FAILURE(ExecSelect(R"((1E0), (NULL), (2E0), (3), (''), (NULL))",
                                      /*infer_rows=*/2, &reader));
   ASSERT_EQ(NANOARROW_TYPE_DOUBLE, reader.fields[0].type);
   ASSERT_NO_FATAL_FAILURE(reader.Next());
@@ -698,7 +720,7 @@ TEST_F(SqliteReaderTest, InferFloatRejectBlob) {
 
 TEST_F(SqliteReaderTest, InferStrReadAll) {
   adbc_validation::StreamReader reader;
-  ASSERT_NO_FATAL_FAILURE(ExecSelect(R"((""), (NULL), (2), (3E0), ("foo"), (NULL))",
+  ASSERT_NO_FATAL_FAILURE(ExecSelect(R"((''), (NULL), (2), (3E0), ('foo'), (NULL))",
                                      /*infer_rows=*/2, &reader));
   ASSERT_EQ(NANOARROW_TYPE_STRING, reader.fields[0].type);
   ASSERT_NO_FATAL_FAILURE(reader.Next());
@@ -781,7 +803,7 @@ TEST_F(SqliteReaderTest, InferTypedParams) {
 
   ASSERT_NO_FATAL_FAILURE(Exec("CREATE TABLE foo (idx, value)"));
   ASSERT_NO_FATAL_FAILURE(
-      Exec(R"(INSERT INTO foo VALUES (0, "foo"), (1, NULL), (2, 4), (3, 1E2))"));
+      Exec(R"(INSERT INTO foo VALUES (0, 'foo'), (1, NULL), (2, 4), (3, 1E2))"));
 
   ASSERT_THAT(adbc_validation::MakeSchema(&schema.value, {{"", NANOARROW_TYPE_INT64}}),
               IsOkErrno());
