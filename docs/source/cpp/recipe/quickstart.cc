@@ -62,7 +62,7 @@
 #include <cstring>
 #include <iostream>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 #include <nanoarrow.h>
 
 /// Then we'll add some (very basic) error checking helpers.
@@ -116,11 +116,11 @@ int main() {
   /// Creating a Connection
   /// ---------------------
   ///
-  /// ADBC distinguishes between "databases", "connections", and
-  /// "statements".  A "database" holds shared state across multiple
-  /// connections.  For example, in the SQLite driver, it holds the
-  /// actual instance of SQLite.  A "connection" is one connection to
-  /// the database.
+  /// ADBC distinguishes between ":term:`databases <database>`",
+  /// ":term:`connections <connection>`", and ":term:`statements
+  /// <statement>`".  A "database" holds shared state across multiple
+  /// connections.  For example, in the SQLite driver, it holds the actual
+  /// instance of SQLite.  A "connection" is one connection to the database.
 
   AdbcConnection connection = {};
   CHECK_ADBC(AdbcConnectionNew(&connection, &error));
@@ -139,7 +139,7 @@ int main() {
   /// -----------------
   ///
   /// We execute a query by setting the query on the statement, then
-  /// calling :cpp:func:`AdbcStatementExecuteQuery`.  The results come
+  /// calling :c:func:`AdbcStatementExecuteQuery`.  The results come
   /// back through the `Arrow C Data Interface`_.
   ///
   /// .. _Arrow C Data Interface: https://arrow.apache.org/docs/format/CDataInterface.html
@@ -155,6 +155,7 @@ int main() {
   /// ahead of time, so this value will actually just be ``-1`` to
   /// indicate that the value is not known.
   std::cout << "Got " << rows_affected << " rows" << std::endl;
+  // Output: Got -1 rows
 
   /// We need an Arrow implementation to read the actual results.  We
   /// can use `Arrow C++`_ or `Nanoarrow`_ for that.  For simplicity,
@@ -172,7 +173,9 @@ int main() {
   /// Then we can use Nanoarrow to print it:
   char buf[1024] = {};
   ArrowSchemaToString(&schema, buf, sizeof(buf), /*recursive=*/1);
-  std::cout << buf << std::endl;
+  std::cout << "Result schema: " << buf << std::endl;
+  // Output:
+  // Result schema: struct<THEANSWER: int64>
 
   /// Now we can read the data.  The data comes as a stream of Arrow
   /// record batches.
@@ -197,8 +200,10 @@ int main() {
     }
     ArrowArrayViewReset(&view);
   }
+  // Output:
+  // Got a batch with 1 rows
+  // THEANSWER[0] = 42
 
-  std::cout << "Finished reading result set" << std::endl;
   stream.release(&stream);
 
   /// Cleanup

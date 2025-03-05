@@ -22,8 +22,8 @@
 #include <string>
 #include <vector>
 
-#include "adbc.h"
-#include "adbc_driver_manager.h"
+#include "arrow-adbc/adbc.h"
+#include "arrow-adbc/adbc_driver_manager.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -105,7 +105,7 @@ TEST_F(DriverManager, ConnectionOptions) {
               IsOkStatus(&error));
   ASSERT_EQ(ADBC_STATUS_NOT_IMPLEMENTED,
             AdbcConnectionInit(&connection, &database, &error));
-  ASSERT_THAT(error.message, ::testing::HasSubstr("Unknown connection option foo=bar"));
+  ASSERT_THAT(error.message, ::testing::HasSubstr("Unknown connection option foo='bar'"));
 
   ASSERT_THAT(AdbcConnectionRelease(&connection, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseRelease(&database, &error), IsOkStatus(&error));
@@ -144,7 +144,7 @@ TEST_F(DriverManager, MultiDriverTest) {
   ASSERT_THAT(AdbcDatabaseSetOption(&sqlite_db.value, "unknown", "foo", &error.value),
               IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error.value));
   ASSERT_THAT(error->message,
-              ::testing::HasSubstr("[SQLite] Unknown database option unknown=foo"));
+              ::testing::HasSubstr("Unknown database option unknown='foo'"));
   error->release(&error.value);
 
   ASSERT_THAT(AdbcConnectionNew(&sqlite_conn.value, &error.value),
@@ -187,10 +187,18 @@ class SqliteQuirks : public adbc_validation::DriverQuirks {
       case NANOARROW_TYPE_UINT32:
       case NANOARROW_TYPE_UINT64:
         return NANOARROW_TYPE_INT64;
+      case NANOARROW_TYPE_HALF_FLOAT:
       case NANOARROW_TYPE_FLOAT:
-      case NANOARROW_TYPE_DOUBLE:
         return NANOARROW_TYPE_DOUBLE;
       case NANOARROW_TYPE_LARGE_STRING:
+      case NANOARROW_TYPE_STRING_VIEW:
+        return NANOARROW_TYPE_STRING;
+      case NANOARROW_TYPE_LARGE_BINARY:
+      case NANOARROW_TYPE_FIXED_SIZE_BINARY:
+      case NANOARROW_TYPE_BINARY_VIEW:
+        return NANOARROW_TYPE_BINARY;
+      case NANOARROW_TYPE_DATE32:
+      case NANOARROW_TYPE_TIMESTAMP:
         return NANOARROW_TYPE_STRING;
       default:
         return ingest_type;
@@ -218,6 +226,8 @@ class SqliteQuirks : public adbc_validation::DriverQuirks {
         return std::nullopt;
     }
   }
+  bool supports_metadata_current_catalog() const override { return true; }
+  std::string catalog() const override { return "main"; }
 };
 
 class SqliteDatabaseTest : public ::testing::Test, public adbc_validation::DatabaseTest {
@@ -265,8 +275,6 @@ class SqliteStatementTest : public ::testing::Test,
   void TearDown() override { ASSERT_NO_FATAL_FAILURE(TearDownTest()); }
 
   void TestSqlIngestUInt64() { GTEST_SKIP() << "Cannot ingest UINT64 (out of range)"; }
-  void TestSqlIngestBinary() { GTEST_SKIP() << "Cannot ingest BINARY (not implemented)"; }
-  void TestSqlIngestDate32() { GTEST_SKIP() << "Cannot ingest DATE (not implemented)"; }
   void TestSqlIngestTimestamp() {
     GTEST_SKIP() << "Cannot ingest TIMESTAMP (not implemented)";
   }
@@ -278,6 +286,12 @@ class SqliteStatementTest : public ::testing::Test,
   }
   void TestSqlIngestInterval() {
     GTEST_SKIP() << "Cannot ingest Interval (not implemented)";
+  }
+  void TestSqlIngestListOfInt32() {
+    GTEST_SKIP() << "Cannot ingest list<int32> (not implemented)";
+  }
+  void TestSqlIngestListOfString() {
+    GTEST_SKIP() << "Cannot ingest list<string> (not implemented)";
   }
 
  protected:

@@ -21,6 +21,7 @@ set -e
 : ${ADBC_USE_ASAN:=OFF}
 : ${ADBC_USE_UBSAN:=OFF}
 : ${BUILD_ALL:=1}
+: ${BUILD_DRIVER_BIGQUERY:=${BUILD_ALL}}
 : ${BUILD_DRIVER_FLIGHTSQL:=${BUILD_ALL}}
 : ${BUILD_DRIVER_MANAGER:=${BUILD_ALL}}
 : ${BUILD_DRIVER_POSTGRESQL:=${BUILD_ALL}}
@@ -58,8 +59,8 @@ test_subproject() {
     fi
 
     echo "=== Testing ${subproject} ==="
-    echo env ${options[@]} python -m pytest -vv "${source_dir}/python/${subproject}/tests"
-    env ${options[@]} python -m pytest -vv "${source_dir}/python/${subproject}/tests"
+    echo env ${options[@]} python -m pytest -vvs --full-trace "${source_dir}/python/${subproject}/tests"
+    env ${options[@]} python -m pytest -vvs --full-trace "${source_dir}/python/${subproject}/tests"
     echo
 }
 
@@ -70,6 +71,10 @@ main() {
 
     if [[ -z "${install_dir}" ]]; then
         install_dir="${build_dir}/local"
+    fi
+
+    if [[ "${BUILD_DRIVER_BIGQUERY}" -gt 0 ]]; then
+        test_subproject "${source_dir}" "${install_dir}" adbc_driver_bigquery
     fi
 
     if [[ "${BUILD_DRIVER_FLIGHTSQL}" -gt 0 ]]; then

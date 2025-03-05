@@ -18,13 +18,8 @@
 *.o
 *.so
 *.dll
-adbc.h
-sqlite.c
-statement_reader.c
-statement_reader.h
-types.h
-utils.c
-utils.h
 Makevars
 sqlite3.c
 sqlite3.h
+c/
+arrow-adbc/

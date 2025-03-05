@@ -24,6 +24,7 @@ set -e
 : ${BUILD_DRIVER_SQLITE:=${BUILD_ALL}}
 : ${BUILD_DRIVER_FLIGHTSQL:=${BUILD_ALL}}
 : ${BUILD_DRIVER_SNOWFLAKE:=${BUILD_ALL}}
+: ${BUILD_DRIVER_BIGQUERY:=${BUILD_ALL}}
 : ${BUILD_INTEGRATION_DUCKDB:=${BUILD_ALL}}
 
 test_project() {
@@ -31,27 +32,32 @@ test_project() {
 
     pushd "${build_dir}/"
 
-    local labels="driver-common"
+    local labels=""
+    if [[ "${BUILD_DRIVER_BIGQUERY}" -gt 0 ]]; then
+       labels="${labels}|driver-bigquery"
+    fi
     if [[ "${BUILD_DRIVER_FLIGHTSQL}" -gt 0 ]]; then
        labels="${labels}|driver-flightsql"
     fi
     if [[ "${BUILD_DRIVER_MANAGER}" -gt 0 ]]; then
-       labels="${labels}|driver-manager"
+       labels="${labels}|driver-common|driver-manager"
     fi
     if [[ "${BUILD_DRIVER_POSTGRESQL}" -gt 0 ]]; then
        labels="${labels}|driver-postgresql"
     fi
-    if [[ "${BUILD_DRIVER_SQLITE}" -gt 0 ]]; then
-       labels="${labels}|driver-sqlite"
-    fi
     if [[ "${BUILD_DRIVER_SNOWFLAKE}" -gt 0 ]]; then
        labels="${labels}|driver-snowflake"
+    fi
+    if [[ "${BUILD_DRIVER_SQLITE}" -gt 0 ]]; then
+       labels="${labels}|driver-sqlite"
     fi
     if [[ "${BUILD_INTEGRATION_DUCKDB}" -gt 0 ]]; then
        labels="${labels}|integration-duckdb"
     fi
+    # Remove leading pipe
+    labels="${labels:1}"
 
-    ctest \
+    ctest --progress -VV \
         --output-on-failure \
         --no-tests=error \
         -L "${labels}"
@@ -69,7 +75,6 @@ main() {
 
     export DYLD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${install_dir}/lib"
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${install_dir}/lib"
-    export GODEBUG=cgocheck=2
 
     test_project "${build_dir}"
 }

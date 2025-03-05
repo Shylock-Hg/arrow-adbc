@@ -30,7 +30,7 @@ on:
       - ".github/workflows/rust.yml"
 
 concurrency:
-  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}-rust
   cancel-in-progress: true
 
 permissions:
@@ -38,31 +38,108 @@ permissions:
 
 defaults:
   run:
-    working-directory: rust
+    shell: bash -l -eo pipefail {0}
 
 jobs:
   rust:
     strategy:
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # TODO(alexandreyc): add `windows-latest`
+        # See: https://github.com/apache/arrow-adbc/pull/1803#issuecomment-2117669300
+        os: [macos-13, macos-latest, ubuntu-latest]
     name: "Rust ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-Adead_code" # TODO(alexandreyc): remove this line when implementation is complete
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Use stable Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+      - name: Get required Go version
+        run: |
+          (. ./.env && echo "GO_VERSION=${GO}") >> $GITHUB_ENV
+      - uses: actions/setup-go@v5
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Check format
-        run: cargo fmt -- --check
+          go-version: "${{ env.GO_VERSION }}"
+          check-latest: true
+          cache: true
+          cache-dependency-path: go/adbc/go.sum
+      - name: Install Protoc
+        if: runner.os == 'Linux'
+        run: |
+          curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-$(uname -m).zip" -o protoc.zip
+          unzip protoc.zip -d $HOME/.local
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Protoc
+        if: runner.os == 'macOS'
+        run: |
+          curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-osx-universal_binary.zip" -o protoc.zip
+          unzip "protoc.zip" -d $HOME/.local
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install sqlite3
+        if: runner.os == 'Linux'
+        run: sudo apt-get install libsqlite3-dev
+      - name: Build C++/Go drivers
+        run: |
+          mkdir -p build
+          mkdir -p local
+          pushd build
+          cmake \
+            -DADBC_BUILD_TESTS=OFF \
+            -DADBC_DRIVER_BIGQUERY=ON \
+            -DADBC_DRIVER_FLIGHTSQL=ON \
+            -DADBC_DRIVER_MANAGER=ON \
+            -DADBC_DRIVER_SQLITE=ON \
+            -DADBC_DRIVER_SNOWFLAKE=ON \
+            -DADBC_USE_ASAN=OFF \
+            -DADBC_USE_UBSAN=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=../local \
+            ../c
+          cmake --build . --target install
+          popd
+      - name: Set dynamic linker path
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/local/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Set dynamic linker path
+        if: matrix.os == 'macos-latest'
+        run: |
+          echo "DYLD_LIBRARY_PATH=/opt/homebrew/opt/sqlite/lib:${{ github.workspace }}/local/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Set dynamic linker path
+        if: matrix.os == 'macos-13'
+        run: |
+          echo "DYLD_LIBRARY_PATH=/usr/local/opt/sqlite/lib:${{ github.workspace }}/local/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Set search dir for Snowflake Go lib
+        run: echo "ADBC_SNOWFLAKE_GO_LIB_DIR=${{ github.workspace }}/local/lib" >> "$GITHUB_ENV"
       - name: Clippy
-        run: cargo clippy --tests
+        run: |
+          pushd rust
+          cargo clippy --workspace --all-targets --all-features -- -Dwarnings
+          popd
       - name: Test
-        shell: bash -l {0}
-        run: cargo test
+        run: |
+          pushd rust
+          cargo test --workspace --all-targets --all-features
+          popd
+        # env:
+        # ADBC_SNOWFLAKE_TESTS: 1
+        # ADBC_SNOWFLAKE_URI: ${{ secrets.SNOWFLAKE_URI }}
+        # ADBC_SNOWFLAKE_SQL_DB: ADBC_TESTING
+      - name: Doctests
+        run: |
+          pushd rust
+          cargo test --workspace --doc --all-features
+          popd
       - name: Check docs
-        run: cargo doc
+        run: |
+          pushd rust
+          cargo doc --workspace --all-features
+          popd

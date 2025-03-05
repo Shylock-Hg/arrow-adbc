@@ -27,9 +27,9 @@ import (
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -142,6 +142,7 @@ func (dm *DriverMgrSuite) TestGetObjects() {
 					"catalog_name": "main",
 					"catalog_db_schemas": [
 						{
+					                "db_schema_name": "",
 							"db_schema_tables": [
 								{
 									"table_name": "test_table",
@@ -189,10 +190,6 @@ func (dm *DriverMgrSuite) TestGetObjectsCatalog() {
 
 	expSchema := adbc.GetObjectsSchema
 	dm.True(expSchema.Equal(rdr.Schema()))
-	dm.True(rdr.Next())
-
-	rec := rdr.Record()
-	dm.Equal(int64(0), rec.NumRows())
 	dm.False(rdr.Next())
 }
 
@@ -246,6 +243,7 @@ func (dm *DriverMgrSuite) TestGetObjectsTableName() {
 					"catalog_name": "main",
 					"catalog_db_schemas": [
 						{
+					                "db_schema_name": "",
 							"db_schema_tables": []
 						}
 					]
@@ -279,6 +277,7 @@ func (dm *DriverMgrSuite) TestGetObjectsColumnName() {
 					"catalog_name": "main",
 					"catalog_db_schemas": [
 						{
+					                "db_schema_name": "",
 							"db_schema_tables": [
 								{
 									"table_name": "test_table",
@@ -331,6 +330,7 @@ func (dm *DriverMgrSuite) TestGetObjectsTableType() {
 					"catalog_name": "main",
 					"catalog_db_schemas": [
 						{
+					                "db_schema_name": "",
 							"db_schema_tables": []
 						}
 					]
@@ -363,14 +363,14 @@ func (dm *DriverMgrSuite) TestGetTableSchemaInvalidTable() {
 func (dm *DriverMgrSuite) TestGetTableSchemaCatalog() {
 	catalog := "does_not_exist"
 	schema, err := dm.conn.GetTableSchema(dm.ctx, &catalog, nil, "test_table")
-	dm.NoError(err)
+	dm.Error(err)
 	dm.Nil(schema)
 }
 
 func (dm *DriverMgrSuite) TestGetTableSchemaDBSchema() {
 	dbSchema := "does_not_exist"
 	schema, err := dm.conn.GetTableSchema(dm.ctx, nil, &dbSchema, "test_table")
-	dm.NoError(err)
+	dm.Error(err)
 	dm.Nil(schema)
 }
 
@@ -453,7 +453,7 @@ func (dm *DriverMgrSuite) TestSqlExecuteInvalid() {
 	_, _, err = st.ExecuteQuery(dm.ctx)
 	dm.Require().Error(err)
 
-	var adbcErr *adbc.Error
+	var adbcErr adbc.Error
 	dm.ErrorAs(err, &adbcErr)
 	dm.ErrorContains(adbcErr, "[SQLite] Failed to prepare query:")
 	dm.ErrorContains(adbcErr, "syntax error")
@@ -521,6 +521,7 @@ func (dm *DriverMgrSuite) TestGetParameterSchema() {
 	dm.Require().NoError(err)
 	dm.Require().NoError(st.SetSqlQuery(query))
 	defer st.Close()
+	dm.Require().NoError(st.Prepare(context.Background()))
 
 	expSchema := arrow.NewSchema([]arrow.Field{
 		{Name: "?1", Type: arrow.Null, Nullable: true},
@@ -610,7 +611,7 @@ func TestDriverMgrCustomInitFunc(t *testing.T) {
 		"entrypoint": "ThisSymbolDoesNotExist",
 	})
 	assert.Nil(t, db)
-	var exp *adbc.Error
+	var exp adbc.Error
 	assert.ErrorAs(t, err, &exp)
 	assert.Equal(t, adbc.StatusInternal, exp.Code)
 	if runtime.GOOS == "windows" {
