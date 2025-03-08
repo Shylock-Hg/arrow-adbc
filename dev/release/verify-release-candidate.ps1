@@ -92,6 +92,8 @@ if ($SourceKind -eq "local") {
 } else {
     $ArrowSourceDir = Join-Path $ArrowTempDir $DistName
     New-Item -ItemType Directory -Path $ArrowSourceDir -Force
+    # Convert to an absolute now that it should exist
+    $ArrowSourceDir = $ArrowSourceDir | Resolve-Path | % { $_.Path }
 
     Download-Dist-File "$($DistName).tar.gz"
     Download-Dist-File "$($DistName).tar.gz.sha512"
@@ -115,7 +117,8 @@ Show-Header "Create Conda Environment"
 mamba create -c conda-forge -f -y -p $(Join-Path $ArrowTempDir conda-env) `
   --file $(Join-Path $ArrowSourceDir ci\conda_env_cpp.txt) `
   --file $(Join-Path $ArrowSourceDir ci\conda_env_python.txt) `
-  go
+  go `
+  m2w64-gcc
 
 Invoke-Expression $(conda shell.powershell hook | Out-String)
 conda activate $(Join-Path $ArrowTempDir conda-env)
@@ -137,6 +140,7 @@ New-Item -ItemType Directory -Force -Path $CppBuildDir | Out-Null
 # XXX(apache/arrow-adbc#634): not working on Windows due to it picking
 # up MSVC as the C compiler, which then blows up when /Werror gets
 # passed in by some package
+$env:BUILD_DRIVER_BIGQUERY = "0"
 $env:BUILD_DRIVER_FLIGHTSQL = "0"
 $env:BUILD_DRIVER_SNOWFLAKE = "0"
 

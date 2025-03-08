@@ -30,16 +30,18 @@ add_arrow_lib(adbc_driver_manager
               ${CMAKE_DL_LIBS}
               SHARED_LINK_FLAGS
               ${ADBC_LINK_FLAGS})
-include_directories(SYSTEM ${REPOSITORY_ROOT})
 include_directories(SYSTEM ${REPOSITORY_ROOT}/c/)
+include_directories(SYSTEM ${REPOSITORY_ROOT}/c/include/)
 include_directories(SYSTEM ${REPOSITORY_ROOT}/c/vendor)
 include_directories(SYSTEM ${REPOSITORY_ROOT}/c/driver)
+
+install(FILES "${REPOSITORY_ROOT}/c/include/adbc.h" DESTINATION include)
+install(FILES "${REPOSITORY_ROOT}/c/include/arrow-adbc/adbc.h"
+        DESTINATION include/arrow-adbc)
 
 foreach(LIB_TARGET ${ADBC_LIBRARIES})
   target_compile_definitions(${LIB_TARGET} PRIVATE ADBC_EXPORTING)
 endforeach()
-
-install(FILES "${REPOSITORY_ROOT}/adbc.h" adbc_driver_manager.h DESTINATION include)
 
 if(ADBC_BUILD_TESTS)
   if(ADBC_TEST_LINKAGE STREQUAL "shared")
@@ -58,11 +60,8 @@ if(ADBC_BUILD_TESTS)
                 EXTRA_LINK_LIBS
                 adbc_driver_common
                 adbc_validation
-                nanoarrow
                 ${TEST_LINK_LIBS})
   target_compile_features(adbc-driver-manager-test PRIVATE cxx_std_17)
-  target_include_directories(adbc-driver-manager-test SYSTEM
-                             PRIVATE ${REPOSITORY_ROOT}/c/vendor/nanoarrow/)
 
   add_test_case(version_100_compatibility_test
                 PREFIX
@@ -74,9 +73,6 @@ if(ADBC_BUILD_TESTS)
                 adbc_version_100_compatibility_test.cc
                 EXTRA_LINK_LIBS
                 adbc_validation_util
-                nanoarrow
                 ${TEST_LINK_LIBS})
   target_compile_features(adbc-version-100-compatibility-test PRIVATE cxx_std_17)
-  target_include_directories(adbc-version-100-compatibility-test SYSTEM
-                             PRIVATE ${REPOSITORY_ROOT}/c/vendor/nanoarrow/)
 endif()

@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 
 static size_t kErrorBufferSize = 1024;
 
@@ -165,7 +165,7 @@ void AppendErrorDetail(struct AdbcError* error, const char* key, const uint8_t* 
       return;
     }
 
-    size_t* new_lengths = calloc(new_capacity, sizeof(size_t*));
+    size_t* new_lengths = calloc(new_capacity, sizeof(size_t));
     if (!new_lengths) {
       free(new_keys);
       free(new_values);
@@ -193,8 +193,10 @@ void AppendErrorDetail(struct AdbcError* error, const char* key, const uint8_t* 
     details->capacity = new_capacity;
   }
 
-  char* key_data = strdup(key);
+  char* key_data = malloc(strlen(key) + 1);
   if (!key_data) return;
+  memcpy(key_data, key, strlen(key) + 1);
+
   uint8_t* value_data = malloc(detail_length);
   if (!value_data) {
     free(key_data);
@@ -233,69 +235,8 @@ struct AdbcErrorDetail CommonErrorGetDetail(const struct AdbcError* error, int i
   };
 }
 
-struct SingleBatchArrayStream {
-  struct ArrowSchema schema;
-  struct ArrowArray batch;
-};
-static const char* SingleBatchArrayStreamGetLastError(struct ArrowArrayStream* stream) {
-  return NULL;
-}
-static int SingleBatchArrayStreamGetNext(struct ArrowArrayStream* stream,
-                                         struct ArrowArray* batch) {
-  if (!stream || !stream->private_data) return EINVAL;
-  struct SingleBatchArrayStream* impl =
-      (struct SingleBatchArrayStream*)stream->private_data;
-
-  memcpy(batch, &impl->batch, sizeof(*batch));
-  memset(&impl->batch, 0, sizeof(*batch));
-  return 0;
-}
-static int SingleBatchArrayStreamGetSchema(struct ArrowArrayStream* stream,
-                                           struct ArrowSchema* schema) {
-  if (!stream || !stream->private_data) return EINVAL;
-  struct SingleBatchArrayStream* impl =
-      (struct SingleBatchArrayStream*)stream->private_data;
-
-  return ArrowSchemaDeepCopy(&impl->schema, schema);
-}
-static void SingleBatchArrayStreamRelease(struct ArrowArrayStream* stream) {
-  if (!stream || !stream->private_data) return;
-  struct SingleBatchArrayStream* impl =
-      (struct SingleBatchArrayStream*)stream->private_data;
-  impl->schema.release(&impl->schema);
-  if (impl->batch.release) impl->batch.release(&impl->batch);
-  free(impl);
-
-  memset(stream, 0, sizeof(*stream));
-}
-
-AdbcStatusCode BatchToArrayStream(struct ArrowArray* values, struct ArrowSchema* schema,
-                                  struct ArrowArrayStream* stream,
-                                  struct AdbcError* error) {
-  if (!values->release) {
-    SetError(error, "ArrowArray is not initialized");
-    return ADBC_STATUS_INTERNAL;
-  } else if (!schema->release) {
-    SetError(error, "ArrowSchema is not initialized");
-    return ADBC_STATUS_INTERNAL;
-  } else if (stream->release) {
-    SetError(error, "ArrowArrayStream is already initialized");
-    return ADBC_STATUS_INTERNAL;
-  }
-
-  struct SingleBatchArrayStream* impl =
-      (struct SingleBatchArrayStream*)malloc(sizeof(*impl));
-  memcpy(&impl->schema, schema, sizeof(*schema));
-  memcpy(&impl->batch, values, sizeof(*values));
-  memset(schema, 0, sizeof(*schema));
-  memset(values, 0, sizeof(*values));
-  stream->private_data = impl;
-  stream->get_last_error = SingleBatchArrayStreamGetLastError;
-  stream->get_next = SingleBatchArrayStreamGetNext;
-  stream->get_schema = SingleBatchArrayStreamGetSchema;
-  stream->release = SingleBatchArrayStreamRelease;
-
-  return ADBC_STATUS_OK;
+bool IsCommonError(const struct AdbcError* error) {
+  return error->release == ReleaseErrorWithDetails || error->release == ReleaseError;
 }
 
 int StringBuilderInit(struct StringBuilder* builder, size_t initial_size) {
@@ -309,7 +250,7 @@ int StringBuilderInit(struct StringBuilder* builder, size_t initial_size) {
 }
 int StringBuilderAppend(struct StringBuilder* builder, const char* fmt, ...) {
   va_list argptr;
-  int bytes_available = builder->capacity - builder->size;
+  int bytes_available = (int)builder->capacity - (int)builder->size;
 
   va_start(argptr, fmt);
   int n = vsnprintf(builder->buffer + builder->size, bytes_available, fmt, argptr);
@@ -344,9 +285,7 @@ void StringBuilderReset(struct StringBuilder* builder) {
   memset(builder, 0, sizeof(*builder));
 }
 
-AdbcStatusCode AdbcInitConnectionGetInfoSchema(const uint32_t* info_codes,
-                                               size_t info_codes_length,
-                                               struct ArrowSchema* schema,
+AdbcStatusCode AdbcInitConnectionGetInfoSchema(struct ArrowSchema* schema,
                                                struct ArrowArray* array,
                                                struct AdbcError* error) {
   // TODO: use C equivalent of UniqueSchema to avoid incomplete schema
@@ -796,29 +735,29 @@ struct AdbcGetObjectsData* AdbcGetObjectsDataInit(struct ArrowArrayView* array_v
 
                 column->column_name = ArrowArrayViewGetStringUnsafe(
                     get_objects_data->column_name_array, column_index);
-                column->ordinal_position = ArrowArrayViewGetIntUnsafe(
+                column->ordinal_position = (int32_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->column_position_array, column_index);
                 column->remarks = ArrowArrayViewGetStringUnsafe(
                     get_objects_data->column_remarks_array, column_index);
-                column->xdbc_data_type = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_data_type = (int16_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_data_type_array, column_index);
                 column->xdbc_type_name = ArrowArrayViewGetStringUnsafe(
                     get_objects_data->xdbc_type_name_array, column_index);
-                column->xdbc_column_size = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_column_size = (int32_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_column_size_array, column_index);
-                column->xdbc_decimal_digits = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_decimal_digits = (int16_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_decimal_digits_array, column_index);
-                column->xdbc_num_prec_radix = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_num_prec_radix = (int16_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_num_prec_radix_array, column_index);
-                column->xdbc_nullable = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_nullable = (int16_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_nullable_array, column_index);
                 column->xdbc_column_def = ArrowArrayViewGetStringUnsafe(
                     get_objects_data->xdbc_column_def_array, column_index);
-                column->xdbc_sql_data_type = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_sql_data_type = (int16_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_sql_data_type_array, column_index);
-                column->xdbc_datetime_sub = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_datetime_sub = (int16_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_datetime_sub_array, column_index);
-                column->xdbc_char_octet_length = ArrowArrayViewGetIntUnsafe(
+                column->xdbc_char_octet_length = (int32_t)ArrowArrayViewGetIntUnsafe(
                     get_objects_data->xdbc_char_octet_length_array, column_index);
                 column->xdbc_scope_catalog = ArrowArrayViewGetStringUnsafe(
                     get_objects_data->xdbc_scope_catalog_array, column_index);

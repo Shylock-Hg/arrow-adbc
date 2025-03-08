@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
-	"database/sql"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -32,7 +31,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/driverbase"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
 	"github.com/snowflakedb/gosnowflake"
 	"github.com/youmark/pkcs8"
 )
@@ -93,7 +92,7 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 	case OptionApplicationName:
 		return d.cfg.Application, nil
 	case OptionSSLSkipVerify:
-		if d.cfg.InsecureMode {
+		if d.cfg.DisableOCSPChecks {
 			return adbc.OptionValueEnabled, nil
 		}
 		return adbc.OptionValueDisabled, nil
@@ -125,6 +124,8 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 		return adbc.OptionValueDisabled, nil
 	case OptionLogTracing:
 		return d.cfg.Tracing, nil
+	case OptionClientConfigFile:
+		return d.cfg.ClientConfigFile, nil
 	case OptionUseHighPrecision:
 		if d.useHighPrecision {
 			return adbc.OptionValueEnabled, nil
@@ -136,28 +137,7 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 			return *val, nil
 		}
 	}
-	return "", adbc.Error{
-		Msg:  fmt.Sprintf("[Snowflake] Unknown database option '%s'", key),
-		Code: adbc.StatusNotFound,
-	}
-}
-func (d *databaseImpl) GetOptionBytes(key string) ([]byte, error) {
-	return nil, adbc.Error{
-		Msg:  fmt.Sprintf("[Snowflake] Unknown database option '%s'", key),
-		Code: adbc.StatusNotFound,
-	}
-}
-func (d *databaseImpl) GetOptionInt(key string) (int64, error) {
-	return 0, adbc.Error{
-		Msg:  fmt.Sprintf("[Snowflake] Unknown database option '%s'", key),
-		Code: adbc.StatusNotFound,
-	}
-}
-func (d *databaseImpl) GetOptionDouble(key string) (float64, error) {
-	return 0, adbc.Error{
-		Msg:  fmt.Sprintf("[Snowflake] Unknown database option '%s'", key),
-		Code: adbc.StatusNotFound,
-	}
+	return d.DatabaseImplBase.GetOption(key)
 }
 
 func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
@@ -175,6 +155,13 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 			Params: make(map[string]*string),
 		}
 	}
+
+	dv, _ := d.DatabaseImplBase.DriverInfo.GetInfoForInfoCode(adbc.InfoDriverVersion)
+	driverVersion := dv.(string)
+	defaultAppName := "[ADBC][Go-" + driverVersion + "]"
+	// set default application name to track
+	// unless user overrides it
+	d.cfg.Application = defaultAppName
 
 	var err error
 	for k, v := range cnOptions {
@@ -265,13 +252,16 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 			}
 			d.cfg.ClientTimeout = dur
 		case OptionApplicationName:
+			if !strings.HasPrefix(v, "[ADBC]") {
+				v = defaultAppName + v
+			}
 			d.cfg.Application = v
 		case OptionSSLSkipVerify:
 			switch v {
 			case adbc.OptionValueEnabled:
-				d.cfg.InsecureMode = true
+				d.cfg.DisableOCSPChecks = true
 			case adbc.OptionValueDisabled:
-				d.cfg.InsecureMode = false
+				d.cfg.DisableOCSPChecks = false
 			default:
 				return adbc.Error{
 					Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionSSLSkipVerify, v),
@@ -426,6 +416,8 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 			}
 		case OptionLogTracing:
 			d.cfg.Tracing = v
+		case OptionClientConfigFile:
+			d.cfg.ClientConfigFile = v
 		case OptionUseHighPrecision:
 			switch v {
 			case adbc.OptionValueEnabled:
@@ -456,15 +448,22 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		return nil, errToAdbcErr(adbc.StatusIO, err)
 	}
 
-	return &cnxn{
+	conn := &connectionImpl{
 		cn: cn.(snowflakeConn),
 		db: d, ctor: connector,
-		sqldb: sql.OpenDB(connector),
 		// default enable high precision
 		// SetOption(OptionUseHighPrecision, adbc.OptionValueDisabled) to
 		// get Int64/Float64 instead
-		useHighPrecision: d.useHighPrecision,
-	}, nil
+		useHighPrecision:   d.useHighPrecision,
+		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
+	}
+
+	return driverbase.NewConnectionBuilder(conn).
+		WithAutocommitSetter(conn).
+		WithCurrentNamespacer(conn).
+		WithTableTypeLister(conn).
+		WithDriverInfoPreparer(conn).
+		Connection(), nil
 }
 
 func (d *databaseImpl) Close() error {
