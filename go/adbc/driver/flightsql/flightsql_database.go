@@ -29,10 +29,10 @@ import (
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/driverbase"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/flight"
-	"github.com/apache/arrow/go/v16/arrow/flight/flightsql"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/bluele/gcache"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -42,7 +42,6 @@ import (
 
 type dbDialOpts struct {
 	opts       []grpc.DialOption
-	block      bool
 	maxMsgSize int
 	authority  string
 }
@@ -51,10 +50,6 @@ func (d *dbDialOpts) rebuild() {
 	d.opts = []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(d.maxMsgSize),
 			grpc.MaxCallSendMsgSize(d.maxMsgSize)),
-		grpc.WithUserAgent("ADBC Flight SQL Driver " + infoDriverVersion),
-	}
-	if d.block {
-		d.opts = append(d.opts, grpc.WithBlock())
 	}
 	if d.authority != "" {
 		d.opts = append(d.opts, grpc.WithAuthority(d.authority))
@@ -72,6 +67,7 @@ type databaseImpl struct {
 	dialOpts      dbDialOpts
 	enableCookies bool
 	options       map[string]string
+	userDialOpts  []grpc.DialOption
 }
 
 func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
@@ -194,19 +190,15 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 		delete(cnOptions, OptionTimeoutUpdate)
 	}
 
-	if val, ok := cnOptions[OptionWithBlock]; ok {
-		if val == adbc.OptionValueEnabled {
-			d.dialOpts.block = true
-		} else if val == adbc.OptionValueDisabled {
-			d.dialOpts.block = false
-		} else {
-			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionWithBlock, val),
-				Code: adbc.StatusInvalidArgument,
-			}
+	if tv, ok := cnOptions[OptionTimeoutConnect]; ok {
+		if err = d.timeout.setTimeoutString(OptionTimeoutConnect, tv); err != nil {
+			return err
 		}
-		delete(cnOptions, OptionWithBlock)
+		delete(cnOptions, OptionTimeoutConnect)
 	}
+
+	// gRPC deprecated this and explicitly recommends against it
+	delete(cnOptions, OptionWithBlock)
 
 	if val, ok := cnOptions[OptionWithMaxMsgSize]; ok {
 		var err error
@@ -257,6 +249,8 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 		return d.timeout.queryTimeout.String(), nil
 	case OptionTimeoutUpdate:
 		return d.timeout.updateTimeout.String(), nil
+	case OptionTimeoutConnect:
+		return d.timeout.connectTimeout.String(), nil
 	}
 	if val, ok := d.options[key]; ok {
 		return val, nil
@@ -271,6 +265,8 @@ func (d *databaseImpl) GetOptionInt(key string) (int64, error) {
 	case OptionTimeoutQuery:
 		fallthrough
 	case OptionTimeoutUpdate:
+		fallthrough
+	case OptionTimeoutConnect:
 		val, err := d.GetOptionDouble(key)
 		if err != nil {
 			return 0, err
@@ -289,6 +285,8 @@ func (d *databaseImpl) GetOptionDouble(key string) (float64, error) {
 		return d.timeout.queryTimeout.Seconds(), nil
 	case OptionTimeoutUpdate:
 		return d.timeout.updateTimeout.Seconds(), nil
+	case OptionTimeoutConnect:
+		return d.timeout.connectTimeout.Seconds(), nil
 	}
 
 	return d.DatabaseImplBase.GetOptionDouble(key)
@@ -297,7 +295,7 @@ func (d *databaseImpl) GetOptionDouble(key string) (float64, error) {
 func (d *databaseImpl) SetOption(key, value string) error {
 	// We can't change most options post-init
 	switch key {
-	case OptionTimeoutFetch, OptionTimeoutQuery, OptionTimeoutUpdate:
+	case OptionTimeoutFetch, OptionTimeoutQuery, OptionTimeoutUpdate, OptionTimeoutConnect:
 		return d.timeout.setTimeoutString(key, value)
 	}
 	if strings.HasPrefix(key, OptionRPCCallHeaderPrefix) {
@@ -313,6 +311,8 @@ func (d *databaseImpl) SetOptionInt(key string, value int64) error {
 	case OptionTimeoutQuery:
 		fallthrough
 	case OptionTimeoutUpdate:
+		fallthrough
+	case OptionTimeoutConnect:
 		return d.timeout.setTimeout(key, float64(value))
 	}
 
@@ -326,6 +326,8 @@ func (d *databaseImpl) SetOptionDouble(key string, value float64) error {
 	case OptionTimeoutQuery:
 		fallthrough
 	case OptionTimeoutUpdate:
+		fallthrough
+	case OptionTimeoutConnect:
 		return d.timeout.setTimeout(key, value)
 	}
 
@@ -366,8 +368,13 @@ func getFlightClient(ctx context.Context, loc string, d *databaseImpl, authMiddl
 		creds = insecure.NewCredentials()
 		target = "unix:" + uri.Path
 	}
-	dialOpts := append(d.dialOpts.opts, grpc.WithTransportCredentials(creds))
 
+	dv, _ := d.DatabaseImplBase.DriverInfo.GetInfoForInfoCode(adbc.InfoDriverVersion)
+	driverVersion := dv.(string)
+	dialOpts := append(d.dialOpts.opts, grpc.WithConnectParams(d.timeout.connectParams()), grpc.WithTransportCredentials(creds), grpc.WithUserAgent("ADBC Flight SQL Driver "+driverVersion))
+	dialOpts = append(dialOpts, d.userDialOpts...)
+
+	d.Logger.DebugContext(ctx, "new client", "location", loc)
 	cl, err := flightsql.NewClient(target, nil, middleware, dialOpts...)
 	if err != nil {
 		return nil, adbc.Error{
@@ -395,7 +402,6 @@ func getFlightClient(ctx context.Context, loc string, d *databaseImpl, authMiddl
 		}
 	}
 
-	d.Logger.DebugContext(ctx, "new client", "location", loc)
 	return cl, nil
 }
 
@@ -486,9 +492,17 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		}
 	}
 
-	return &cnxn{cl: cl, db: d, clientCache: cache,
-		hdrs: make(metadata.MD), timeouts: d.timeout,
-		supportInfo: cnxnSupport}, nil
+	conn := &connectionImpl{
+		cl: cl, db: d, clientCache: cache,
+		hdrs: make(metadata.MD), timeouts: d.timeout, supportInfo: cnxnSupport,
+		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
+	}
+
+	return driverbase.NewConnectionBuilder(conn).
+		WithDriverInfoPreparer(conn).
+		WithAutocommitSetter(conn).
+		WithCurrentNamespacer(conn).
+		Connection(), nil
 }
 
 type bearerAuthMiddleware struct {

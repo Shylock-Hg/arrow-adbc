@@ -21,9 +21,9 @@
 # Requirements
 # - Ruby >= 2.3
 # - Maven >= 3.3.9
-# - JDK >=7
+# - JDK >= 11
 # - gcc >= 4.8
-# - Go >= 1.20
+# - Go >= 1.21
 # - Docker
 #
 # To reuse build artifacts between runs set ARROW_TMPDIR environment variable to
@@ -168,8 +168,7 @@ test_apt() {
   if [ "${TEST_STAGING:-0}" -gt 0 ]; then
     verify_type=staging-${verify_type}
   fi
-  for target in "debian:bullseye" \
-                "debian:bookworm" \
+  for target in "debian:bookworm" \
                 "ubuntu:jammy"; do \
     show_info "Verifying ${target}..."
     if ! docker run \
@@ -240,6 +239,59 @@ setup_tempdir() {
   echo "Working in sandbox ${ARROW_TMPDIR}"
 }
 
+install_dotnet() {
+  # Install C# if doesn't already exist
+  if [ "${DOTNET_ALREADY_INSTALLED:-0}" -gt 0 ]; then
+    show_info ".NET already installed $(which csharp) (.NET $(dotnet --version))"
+    return 0
+  fi
+
+  show_info "Ensuring that .NET is installed..."
+
+  if dotnet --version | grep 8\.0 > /dev/null 2>&1; then
+    local csharp_bin=$(dirname $(which dotnet))
+    show_info "Found C# at $(which csharp) (.NET $(dotnet --version))"
+  else
+    if which dotnet > /dev/null 2>&1; then
+      show_info "dotnet found but it is the wrong version and will be ignored."
+    fi
+    local csharp_bin=${ARROW_TMPDIR}/csharp/bin
+    local dotnet_version=8.0.204
+    local dotnet_platform=
+    case "$(uname)" in
+      Linux)
+        dotnet_platform=linux
+        ;;
+      Darwin)
+        dotnet_platform=macos
+        ;;
+    esac
+    local dotnet_download_thank_you_url=https://dotnet.microsoft.com/download/thank-you/dotnet-sdk-${dotnet_version}-${dotnet_platform}-x64-binaries
+    local dotnet_download_url=$( \
+      curl -sL ${dotnet_download_thank_you_url} | \
+        grep 'directLink' | \
+        grep -E -o 'https://download[^"]+' | \
+        sed -n 2p)
+    mkdir -p ${csharp_bin}
+    curl -sL ${dotnet_download_url} | \
+      tar xzf - -C ${csharp_bin}
+    PATH=${csharp_bin}:${PATH}
+    show_info "Installed C# at $(which csharp) (.NET $(dotnet --version))"
+  fi
+
+  # Ensure to have sourcelink installed
+  if ! dotnet tool list | grep sourcelink > /dev/null 2>&1; then
+    dotnet new tool-manifest
+    dotnet tool install --local sourcelink
+    PATH=${csharp_bin}:${PATH}
+    if ! dotnet tool run sourcelink --help > /dev/null 2>&1; then
+      export DOTNET_ROOT=${csharp_bin}
+    fi
+  fi
+
+  DOTNET_ALREADY_INSTALLED=1
+}
+
 install_go() {
   # Install go
   if [ "${GO_ALREADY_INSTALLED:-0}" -gt 0 ]; then
@@ -254,7 +306,7 @@ install_go() {
     return 0
   fi
 
-  local version=1.19.13
+  local version=1.21.8
   show_info "Installing go version ${version}..."
 
   local arch="$(uname -m)"
@@ -271,7 +323,7 @@ install_go() {
   fi
 
   local archive="go${version}.${os}-${arch}.tar.gz"
-  curl -sLO https://dl.google.com/go/$archive
+  curl -sLO https://go.dev/dl/$archive
 
   local prefix=${ARROW_TMPDIR}/go
   mkdir -p $prefix
@@ -288,10 +340,49 @@ install_go() {
   GO_ALREADY_INSTALLED=1
 }
 
+install_rust() {
+  if [ "${RUST_ALREADY_INSTALLED:-0}" -gt 0 ]; then
+    show_info "Rust already installed at $(command -v cargo)"
+    show_info "$(cargo --version)"
+    return 0
+  fi
+
+  if [[ -f ${ARROW_TMPDIR}/cargo/env ]]; then
+    source ${ARROW_TMPDIR}/cargo/env
+    rustup default stable
+    show_info "$(cargo version) installed at $(command -v cargo)"
+    RUST_ALREADY_INSTALLED=1
+    return 0
+  fi
+
+  if command -v cargo > /dev/null; then
+    show_info "Found $(cargo version) at $(command -v cargo)"
+    RUST_ALREADY_INSTALLED=1
+    return 0
+  fi
+
+  show_info "Installing Rust..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |\
+      env \
+          RUSTUP_HOME=${ARROW_TMPDIR}/rustup \
+          CARGO_HOME=${ARROW_TMPDIR}/cargo \
+          sh -s -- \
+          --default-toolchain stable \
+          --no-modify-path \
+          -y
+
+  source ${ARROW_TMPDIR}/cargo/env
+  rustup default stable
+
+  show_info "$(cargo version) installed at $(command -v cargo)"
+
+  RUST_ALREADY_INSTALLED=1
+}
+
 install_conda() {
   # Setup short-lived miniconda for Python and integration tests
   show_info "Ensuring that Conda is installed..."
-  local prefix=$ARROW_TMPDIR/mambaforge
+  local prefix=$ARROW_TMPDIR/miniforge
 
   # Setup miniconda only if the directory doesn't exist yet
   if [ "${CONDA_ALREADY_INSTALLED:-0}" -eq 0 ]; then
@@ -299,7 +390,7 @@ install_conda() {
       show_info "Installing miniconda at ${prefix}..."
       local arch=$(uname -m)
       local platform=$(uname)
-      local url="https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-${platform}-${arch}.sh"
+      local url="https://github.com/conda-forge/miniforge/releases/latest/download/miniforge3-${platform}-${arch}.sh"
       curl -sL -o miniconda.sh $url
       bash miniconda.sh -b -p $prefix
       rm -f miniconda.sh
@@ -319,9 +410,7 @@ install_conda() {
 maybe_setup_conda() {
   # Optionally setup conda environment with the passed dependencies
   local env="conda-${CONDA_ENV:-source}"
-  # XXX(https://github.com/apache/arrow-adbc/issues/1247): no duckdb for
-  # python 3.12 on conda-forge right now
-  local pyver=${PYTHON_VERSION:-3.11}
+  local pyver=${PYTHON_VERSION:-3}
 
   if [ "${USE_CONDA}" -gt 0 ]; then
     show_info "Configuring Conda environment..."
@@ -346,6 +435,13 @@ maybe_setup_conda() {
     echo "Conda environment is active despite that USE_CONDA is set to 0."
     echo "Deactivate the environment using \`conda deactivate\` before running the verification script."
     return 1
+  fi
+}
+
+maybe_setup_dotnet() {
+  show_info "Ensuring that .NET is installed..."
+  if [ "${USE_CONDA}" -eq 0 ]; then
+    install_dotnet
   fi
 }
 
@@ -405,22 +501,30 @@ maybe_setup_go() {
   fi
 }
 
+maybe_setup_rust() {
+  show_info "Ensuring that Rust is installed..."
+  if [ "${USE_CONDA}" -eq 0 ]; then
+    install_rust
+  fi
+}
+
 test_cpp() {
   show_header "Build, install and test C++ libraries"
 
   # Build and test C++
   maybe_setup_go
+  # XXX: pin Python for now since various other packages haven't caught up
   maybe_setup_conda \
     --file ci/conda_env_cpp.txt \
     compilers \
-    go=1.20 || exit 1
+    go=1.22 python=3.12 || exit 1
 
   if [ "${USE_CONDA}" -gt 0 ]; then
     export CMAKE_PREFIX_PATH="${CONDA_BACKUP_CMAKE_PREFIX_PATH}:${CMAKE_PREFIX_PATH}"
     # The CMake setup forces RPATH to be the Conda prefix
-    local -r install_prefix="${CONDA_PREFIX}"
+    export CPP_INSTALL_PREFIX="${CONDA_PREFIX}"
   else
-    local -r install_prefix="${ARROW_TMPDIR}/local"
+    export CPP_INSTALL_PREFIX="${ARROW_TMPDIR}/local"
   fi
 
   export CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-${NPROC}}
@@ -429,14 +533,14 @@ test_cpp() {
   export ADBC_CMAKE_ARGS="-DADBC_INSTALL_NAME_RPATH=OFF"
   export ADBC_USE_ASAN=OFF
   export ADBC_USE_UBSAN=OFF
-  "${ADBC_DIR}/ci/scripts/cpp_build.sh" "${ADBC_SOURCE_DIR}" "${ARROW_TMPDIR}/cpp-build" "${install_prefix}"
+  "${ADBC_DIR}/ci/scripts/cpp_build.sh" "${ADBC_SOURCE_DIR}" "${ARROW_TMPDIR}/cpp-build" "${CPP_INSTALL_PREFIX}"
   # FlightSQL driver requires running database for testing
   export BUILD_DRIVER_FLIGHTSQL=0
   # PostgreSQL driver requires running database for testing
   export BUILD_DRIVER_POSTGRESQL=0
   # Snowflake driver requires snowflake creds for testing
   export BUILD_DRIVER_SNOWFLAKE=0
-  "${ADBC_DIR}/ci/scripts/cpp_test.sh" "${ARROW_TMPDIR}/cpp-build" "${install_prefix}"
+  "${ADBC_DIR}/ci/scripts/cpp_test.sh" "${ARROW_TMPDIR}/cpp-build" "${CPP_INSTALL_PREFIX}"
   export BUILD_DRIVER_FLIGHTSQL=1
   export BUILD_DRIVER_POSTGRESQL=1
   export BUILD_DRIVER_SNOWFLAKE=1
@@ -445,7 +549,7 @@ test_cpp() {
 test_java() {
   show_header "Build and test Java libraries"
 
-  # Build and test Java (Requires newer Maven -- I used 3.3.9)
+  # Build and test Java (Requires Maven >= 3.6.3)
   maybe_setup_conda maven || exit 1
 
   "${ADBC_DIR}/ci/scripts/java_build.sh" "${ADBC_SOURCE_DIR}" "${ARROW_TMPDIR}/java"
@@ -456,8 +560,9 @@ test_python() {
   show_header "Build and test Python libraries"
 
   # Build and test Python
-  maybe_setup_virtualenv cython duckdb pandas protobuf pyarrow pytest setuptools_scm setuptools || exit 1
-  maybe_setup_conda --file "${ADBC_DIR}/ci/conda_env_python.txt" || exit 1
+  maybe_setup_virtualenv cython duckdb pandas protobuf pyarrow pytest setuptools_scm setuptools importlib_resources || exit 1
+  # XXX: pin Python for now since various other packages haven't caught up
+  maybe_setup_conda --file "${ADBC_DIR}/ci/conda_env_python.txt" python=3.12 || exit 1
 
   if [ "${USE_CONDA}" -gt 0 ]; then
     CMAKE_PREFIX_PATH="${CONDA_BACKUP_CMAKE_PREFIX_PATH}:${CMAKE_PREFIX_PATH}"
@@ -539,9 +644,11 @@ test_glib() {
 test_csharp() {
   show_header "Build and test C# libraries"
 
-  install_csharp
+  maybe_setup_dotnet
+  maybe_setup_conda dotnet || exit 1
 
-  echo "C♯ is not implemented"
+  "${ADBC_DIR}/ci/scripts/csharp_build.sh" "${ADBC_SOURCE_DIR}"
+  "${ADBC_DIR}/ci/scripts/csharp_test.sh" "${ADBC_SOURCE_DIR}"
 }
 
 test_js() {
@@ -564,7 +671,7 @@ test_go() {
   # apache/arrow-adbc#517: `go build` calls git. Don't assume system
   # has git; even if it's there, go_build.sh sets DYLD_LIBRARY_PATH
   # which can interfere with system git.
-  maybe_setup_conda compilers git go=1.20 || exit 1
+  maybe_setup_conda compilers git go=1.22 || exit 1
 
   if [ "${USE_CONDA}" -gt 0 ]; then
     # The CMake setup forces RPATH to be the Conda prefix
@@ -576,6 +683,18 @@ test_go() {
   export CGO_ENABLED=1
   "${ADBC_DIR}/ci/scripts/go_build.sh" "${ADBC_SOURCE_DIR}" "${ARROW_TMPDIR}/go-build" "${install_prefix}"
   "${ADBC_DIR}/ci/scripts/go_test.sh" "${ADBC_SOURCE_DIR}" "${ARROW_TMPDIR}/go-build" "${install_prefix}"
+}
+
+test_rust() {
+  show_header "Build and test Rust libraries"
+
+  maybe_setup_rust || exit 1
+  maybe_setup_conda rust || exit 1
+
+  # We expect the C++ libraries to exist.
+  export ADBC_SNOWFLAKE_GO_LIB_DIR="${CPP_INSTALL_PREFIX}/lib"
+  "${ADBC_DIR}/ci/scripts/rust_build.sh" "${ADBC_SOURCE_DIR}"
+  "${ADBC_DIR}/ci/scripts/rust_test.sh" "${ADBC_SOURCE_DIR}" "${CPP_INSTALL_PREFIX}"
 }
 
 ensure_source_directory() {
@@ -615,6 +734,15 @@ ensure_source_directory() {
   if [ ! -d "${ARROW_SOURCE_DIR}" ]; then
     git clone --depth=1 https://github.com/$ARROW_REPOSITORY $ARROW_SOURCE_DIR
   fi
+
+  source "${ADBC_SOURCE_DIR}/dev/release/versions.env"
+  echo "Versions:"
+  echo "Release: ${RELEASE} (requested: ${VERSION})"
+  echo "C#: ${VERSION_CSHARP}"
+  echo "Java: ${VERSION_JAVA}"
+  echo "C/C++/GLib/Go/Python/Ruby: ${VERSION_NATIVE}"
+  echo "R: ${VERSION_R}"
+  echo "Rust: ${VERSION_RUST}"
 }
 
 test_source_distribution() {
@@ -636,6 +764,9 @@ test_source_distribution() {
   if [ ${TEST_CPP} -gt 0 ]; then
     test_cpp
   fi
+  if [ ${TEST_CSHARP} -gt 0 ]; then
+    test_csharp
+  fi
   if [ ${TEST_GLIB} -gt 0 ]; then
     test_glib
   fi
@@ -650,6 +781,9 @@ test_source_distribution() {
   fi
   if [ ${TEST_R} -gt 0 ]; then
     test_r
+  fi
+  if [ ${TEST_RUST} -gt 0 ]; then
+    test_rust
   fi
 
   popd
@@ -694,7 +828,7 @@ test_linux_wheels() {
     local arch="x86_64"
   fi
 
-  local python_versions="${TEST_PYTHON_VERSIONS:-3.9 3.10 3.11}"
+  local python_versions="${TEST_PYTHON_VERSIONS:-3.9 3.10 3.11 3.12}"
 
   for python in ${python_versions}; do
     local pyver=${python/m}
@@ -702,20 +836,21 @@ test_linux_wheels() {
     CONDA_ENV=wheel-${pyver}-${arch} PYTHON_VERSION=${pyver} maybe_setup_conda || exit 1
     VENV_ENV=wheel-${pyver}-${arch} PYTHON_VERSION=${pyver} maybe_setup_virtualenv || continue
     pip install --force-reinstall \
-        adbc_*-${TEST_PYARROW_VERSION:-${VERSION}}-cp${pyver/.}-cp${python/.}-manylinux*${arch}*.whl \
-        adbc_*-${TEST_PYARROW_VERSION:-${VERSION}}-py3-none-manylinux*${arch}*.whl
+        adbc_*-${VERSION_NATIVE}-cp${pyver/.}-cp${python/.}-manylinux*${arch}*.whl \
+        adbc_*-${VERSION_NATIVE}-py3-none-manylinux*${arch}*.whl
     ${ADBC_DIR}/ci/scripts/python_wheel_unix_test.sh ${ADBC_SOURCE_DIR}
   done
 }
 
 test_macos_wheels() {
-  local python_versions="3.9 3.10 3.11"
   # apple silicon processor
   if [ "$(uname -m)" = "arm64" ]; then
     local platform_tags="arm64"
   else
     local platform_tags="x86_64"
   fi
+
+  local python_versions="${TEST_PYTHON_VERSIONS:-3.9 3.10 3.11 3.12}"
 
   # verify arch-native wheels inside an arch-native conda environment
   for python in ${python_versions}; do
@@ -727,8 +862,8 @@ test_macos_wheels() {
       VENV_ENV=wheel-${pyver}-${platform} PYTHON_VERSION=${pyver} maybe_setup_virtualenv || continue
 
       pip install --force-reinstall \
-          adbc_*-${TEST_PYARROW_VERSION:-${VERSION}}-cp${pyver/.}-cp${python/.}-macosx_*_${platform}.whl \
-          adbc_*-${TEST_PYARROW_VERSION:-${VERSION}}-py3-none-macosx_*_${platform}.whl
+          adbc_*-${VERSION_NATIVE}-cp${pyver/.}-cp${python/.}-macosx_*_${platform}.whl \
+          adbc_*-${VERSION_NATIVE}-py3-none-macosx_*_${platform}.whl
       ${ADBC_DIR}/ci/scripts/python_wheel_unix_test.sh ${ADBC_SOURCE_DIR}
     done
   done
@@ -766,7 +901,7 @@ test_jars() {
   local -r components=(".jar" "-javadoc.jar" "-sources.jar")
   for package in "${packages[@]}"; do
       for component in "${components[@]}"; do
-          local filename="${BINARY_DIR}/${package}-${VERSION}${component}"
+          local filename="${BINARY_DIR}/${package}-${VERSION_JAVA}${component}"
           if [[ ! -f "${filename}" ]];  then
              echo "ERROR: missing artifact ${filename}"
              return 1
@@ -802,9 +937,10 @@ test_jars() {
 : ${TEST_JS:=${TEST_SOURCE}}
 : ${TEST_GO:=${TEST_SOURCE}}
 : ${TEST_R:=${TEST_SOURCE}}
+: ${TEST_RUST:=${TEST_SOURCE}}
 
 # Automatically test if its activated by a dependent
-TEST_CPP=$((${TEST_CPP} + ${TEST_GO} + ${TEST_GLIB} + ${TEST_PYTHON}))
+TEST_CPP=$((${TEST_CPP} + ${TEST_GO} + ${TEST_GLIB} + ${TEST_PYTHON} + ${TEST_RUST}))
 
 # Execute tests in a conda enviroment
 : ${USE_CONDA:=0}

@@ -65,11 +65,13 @@ build_subproject() {
         -DCMAKE_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}"
 
     run-clang-tidy \
+        -extra-arg=-Wno-unknown-warning-option \
+        -extra-arg=-Wno-unused-command-line-argument \
         -j $(nproc) \
         -p "${build_dir}" \
         -fix \
         -quiet \
-        $(jq -r ".[] | .file" "${build_dir}/compile_commands.json")
+        $(jq -r ".[] | .file | select(contains(\"c/vendor\") | not)" "${build_dir}/compile_commands.json")
 
     set +x
     popd
