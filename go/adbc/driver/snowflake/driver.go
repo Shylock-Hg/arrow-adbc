@@ -19,20 +19,18 @@ package snowflake
 
 import (
 	"errors"
+	"maps"
+	"net/http"
 	"runtime/debug"
 	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/driverbase"
-	"github.com/apache/arrow/go/v16/arrow/memory"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/snowflakedb/gosnowflake"
-	"golang.org/x/exp/maps"
 )
 
 const (
-	infoDriverName = "ADBC Snowflake Driver - Go"
-	infoVendorName = "Snowflake"
-
 	OptionDatabase  = "adbc.snowflake.sql.db"
 	OptionSchema    = "adbc.snowflake.sql.schema"
 	OptionWarehouse = "adbc.snowflake.sql.warehouse"
@@ -96,6 +94,8 @@ const (
 	OptionDisableTelemetry           = "adbc.snowflake.sql.client_option.disable_telemetry"
 	// snowflake driver logging level
 	OptionLogTracing = "adbc.snowflake.sql.client_option.tracing"
+	// snowflake driver client logging config file
+	OptionClientConfigFile = "adbc.snowflake.sql.client_option.config_file"
 	// When true, the MFA token is cached in the credential manager. True by default
 	// on Windows/OSX, false for Linux
 	OptionClientRequestMFAToken = "adbc.snowflake.sql.client_option.cache_mfa_token"
@@ -119,36 +119,17 @@ const (
 )
 
 var (
-	infoDriverVersion      string
-	infoDriverArrowVersion string
-	infoSupportedCodes     []adbc.InfoCode
+	infoVendorVersion string
 )
 
 func init() {
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range info.Deps {
 			switch {
-			case dep.Path == "github.com/apache/arrow-adbc/go/adbc/driver/snowflake":
-				infoDriverVersion = dep.Version
-			case strings.HasPrefix(dep.Path, "github.com/apache/arrow/go/"):
-				infoDriverArrowVersion = dep.Version
+			case dep.Path == "github.com/snowflakedb/gosnowflake":
+				infoVendorVersion = dep.Version
 			}
 		}
-	}
-	// XXX: Deps not populated in tests
-	// https://github.com/golang/go/issues/33976
-	if infoDriverVersion == "" {
-		infoDriverVersion = "(unknown or development build)"
-	}
-	if infoDriverArrowVersion == "" {
-		infoDriverArrowVersion = "(unknown or development build)"
-	}
-
-	infoSupportedCodes = []adbc.InfoCode{
-		adbc.InfoDriverName,
-		adbc.InfoDriverVersion,
-		adbc.InfoDriverArrowVersion,
-		adbc.InfoVendorName,
 	}
 }
 
@@ -186,21 +167,76 @@ func errToAdbcErr(code adbc.Status, err error) error {
 	}
 }
 
+func quoteTblName(name string) string {
+	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
+}
+
+type config struct {
+	*gosnowflake.Config
+}
+
+// Option is a function type to set custom driver configurations.
+//
+// It is intended for configurations that cannot be provided from the standard options map,
+// e.g. the underlying HTTP transporter.
+type Option func(*config) error
+
+// WithTransporter sets the custom transporter to use for the Snowflake connection.
+// This allows to intercept HTTP requests and responses.
+func WithTransporter(transporter http.RoundTripper) Option {
+	return func(cfg *config) error {
+		cfg.Transporter = transporter
+		return nil
+	}
+}
+
+// Driver is the Snowflake driver interface.
+//
+// It extends the base adbc.Driver to provide additional options
+// when creating the Snowflake database.
+type Driver interface {
+	adbc.Driver
+
+	// NewDatabaseWithOptions creates a new Snowflake database with the provided options.
+	NewDatabaseWithOptions(map[string]string, ...Option) (adbc.Database, error)
+}
+
+var _ Driver = (*driverImpl)(nil)
+
 type driverImpl struct {
 	driverbase.DriverImplBase
 }
 
 // NewDriver creates a new Snowflake driver using the given Arrow allocator.
-func NewDriver(alloc memory.Allocator) adbc.Driver {
-	return driverbase.NewDriver(&driverImpl{DriverImplBase: driverbase.NewDriverImplBase("Snowflake", alloc)})
+func NewDriver(alloc memory.Allocator) Driver {
+	info := driverbase.DefaultDriverInfo("Snowflake")
+	if infoVendorVersion != "" {
+		if err := info.RegisterInfoCode(adbc.InfoVendorVersion, infoVendorVersion); err != nil {
+			panic(err)
+		}
+	}
+	return &driverImpl{DriverImplBase: driverbase.NewDriverImplBase(info, alloc)}
 }
 
 func (d *driverImpl) NewDatabase(opts map[string]string) (adbc.Database, error) {
+	return d.NewDatabaseWithOptions(opts)
+}
+
+func (d *driverImpl) NewDatabaseWithOptions(opts map[string]string, optFuncs ...Option) (adbc.Database, error) {
 	opts = maps.Clone(opts)
-	db := &databaseImpl{DatabaseImplBase: driverbase.NewDatabaseImplBase(&d.DriverImplBase),
-		useHighPrecision: true}
+	db := &databaseImpl{
+		DatabaseImplBase: driverbase.NewDatabaseImplBase(&d.DriverImplBase),
+		useHighPrecision: true,
+	}
 	if err := db.SetOptions(opts); err != nil {
 		return nil, err
+	}
+
+	cfg := &config{Config: db.cfg}
+	for _, opt := range optFuncs {
+		if err := opt(cfg); err != nil {
+			return nil, err
+		}
 	}
 
 	return driverbase.NewDatabase(db), nil
