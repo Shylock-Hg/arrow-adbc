@@ -209,6 +209,7 @@ Why ADBC?
 
    faq
    glossary
+   genindex
 
 .. toctree::
    :maxdepth: 1
@@ -235,6 +236,7 @@ Why ADBC?
    driver/postgresql
    driver/snowflake
    driver/sqlite
+   driver/authoring
 
 .. toctree::
    :maxdepth: 1
@@ -244,6 +246,8 @@ Why ADBC?
    format/specification
    format/versioning
    format/comparison
+   format/how_manager
+   format/related_work
 
 .. toctree::
    :maxdepth: 1
@@ -252,4 +256,5 @@ Why ADBC?
 
    development/contributing
    development/nightly
+   development/versioning
    development/releasing

@@ -19,18 +19,19 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.append(str(Path("./ext/sphinx_recipe").resolve()))
 sys.path.append(str(Path("./ext").resolve()))
 
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = "ADBC"
-copyright = """2022–2024 The Apache Software Foundation.  Apache Arrow, Arrow,
+copyright = """2022–2025 The Apache Software Foundation.  Apache Arrow, Arrow,
 Apache, the Apache feather logo, and the Apache Arrow project logo are either
 registered trademarks or trademarks of The Apache Software Foundation in the
 United States and other countries."""
 author = "the Apache Arrow Developers"
-release = "0.10.0 (dev)"
+release = "18 (dev)"
 # Needed to generate version switcher
 version = release
 
@@ -40,10 +41,9 @@ version = release
 exclude_patterns = []
 extensions = [
     # recipe directive
-    "adbc_cookbook",
+    "sphinx_recipe",
     # generic directives to enable intersphinx for java
     "adbc_java_domain",
-    "breathe",
     "numpydoc",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
@@ -53,6 +53,23 @@ extensions = [
     "sphinxext.opengraph",
 ]
 templates_path = ["_templates"]
+
+
+def on_missing_reference(app, env, node, contnode):
+    if str(contnode) == "polars.DataFrame":
+        # Polars does something odd with Sphinx such that polars.DataFrame
+        # isn't xrefable; suppress the warning.
+        return contnode
+    elif str(contnode) == "CapsuleType":
+        # CapsuleType is only in 3.13+
+        return contnode
+    else:
+        return None
+
+
+def setup(app):
+    app.connect("missing-reference", on_missing_reference)
+
 
 # -- Options for autodoc ----------------------------------------------------
 
@@ -78,12 +95,15 @@ autodoc_default_options = {
     "show-inheritance": True,
 }
 
-# -- Options for Breathe -----------------------------------------------------
-
-breathe_default_project = "adbc"
-breathe_projects = {
-    "adbc": "../../c/apidoc/xml/",
-}
+# https://stackoverflow.com/questions/11417221/sphinx-autodoc-gives-warning-pyclass-reference-target-not-found-type-warning
+nitpick_ignore = [
+    ("py:class", "abc.ABC"),
+    ("py:class", "datetime.date"),
+    ("py:class", "datetime.datetime"),
+    ("py:class", "datetime.time"),
+    ("py:class", "enum.Enum"),
+    ("py:class", "enum.IntEnum"),
+]
 
 # -- Options for doctest -----------------------------------------------------
 
@@ -112,10 +132,18 @@ html_theme_options = {
     "source_directory": "docs/source/",
 }
 
+# -- Options for sphinx-recipe -----------------------------------------------
+
+recipe_repo_url_template = (
+    "https://github.com/apache/arrow-adbc/blob/main/docs/source/{rel_filename}"
+)
+
 # -- Options for Intersphinx -------------------------------------------------
 
 intersphinx_mapping = {
     "arrow": ("https://arrow.apache.org/docs/", None),
+    "pandas": ("https://pandas.pydata.org/docs/", None),
+    "polars": ("https://docs.pola.rs/api/python/stable/", None),
 }
 
 # Add env vars like ADBC_INTERSPHINX_MAPPING_adbc_java = url;path
@@ -130,10 +158,6 @@ def _find_intersphinx_mappings():
             url, _, path = val.partition(";")
             print("[ADBC] Found Intersphinx mapping", name)
             intersphinx_mapping[name] = (url, path)
-        #         "adbc_java": (
-        #     "http://localhost:8000/",
-        #     "/home/lidavidm/Code/arrow-adbc/java/target/site/apidocs/objects.inv",
-        # ),
 
 
 _find_intersphinx_mappings()

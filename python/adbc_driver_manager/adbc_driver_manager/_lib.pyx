@@ -20,23 +20,27 @@
 """Low-level ADBC API."""
 
 import enum
+import functools
 import threading
+import os
 import typing
-from typing import List, Tuple
+import sys
+import warnings
+from typing import List, Optional, Tuple
 
-cimport cpython
 import cython
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from cpython.pycapsule cimport (
-    PyCapsule_GetPointer, PyCapsule_New, PyCapsule_CheckExact
+    PyCapsule_GetPointer, PyCapsule_IsValid, PyCapsule_New
 )
-from libc.stdint cimport int32_t, int64_t, uint8_t, uint32_t, uintptr_t
+from libc.stdint cimport int64_t, uint8_t, uint32_t, uintptr_t
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcpy, memset
+from libcpp.string cimport string as c_string
 from libcpp.vector cimport vector as c_vector
 
 if typing.TYPE_CHECKING:
-    from typing import Self
+    from typing import Self  # no-cython-lint
 
 
 class AdbcStatusCode(enum.IntEnum):
@@ -92,7 +96,15 @@ class Error(Exception):
         Additional error details, if present.
     """
 
-    def __init__(self, message, *, status_code, vendor_code=None, sqlstate=None, details=None):
+    def __init__(
+        self,
+        message,
+        *,
+        status_code,
+        vendor_code=None,
+        sqlstate=None,
+        details=None,
+    ):
         super().__init__(message)
         self.status_code = AdbcStatusCode(status_code)
         self.vendor_code = vendor_code
@@ -163,7 +175,7 @@ INGEST_OPTION_MODE_CREATE_APPEND = ADBC_INGEST_OPTION_MODE_CREATE_APPEND.decode(
 INGEST_OPTION_TARGET_TABLE = ADBC_INGEST_OPTION_TARGET_TABLE.decode("utf-8")
 
 
-cdef object convert_error(CAdbcStatusCode status, CAdbcError* error) except *:
+cdef object convert_error(CAdbcStatusCode status, CAdbcError* error):
     cdef CAdbcErrorDetail c_detail
 
     if status == ADBC_STATUS_OK:
@@ -178,7 +190,10 @@ cdef object convert_error(CAdbcStatusCode status, CAdbcError* error) except *:
         if error.message != NULL:
             message += ": "
             message += error.message.decode("utf-8", "replace")
-        if error.vendor_code and error.vendor_code != ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA:
+        if (
+                error.vendor_code and
+                error.vendor_code != ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA
+        ):
             vendor_code = error.vendor_code
             message += f". Vendor code: {vendor_code}"
         if error.sqlstate[0] != 0:
@@ -194,7 +209,9 @@ cdef object convert_error(CAdbcStatusCode status, CAdbcError* error) except *:
                 break
             details.append(
                 (c_detail.key,
-                 PyBytes_FromStringAndSize(<const char*> c_detail.value, c_detail.value_length)))
+                 PyBytes_FromStringAndSize(
+                     <const char*> c_detail.value,
+                     c_detail.value_length)))
 
         if error.release:
             error.release(error)
@@ -221,8 +238,19 @@ cdef object convert_error(CAdbcStatusCode status, CAdbcError* error) except *:
                     ADBC_STATUS_UNAUTHORIZED):
         klass = ProgrammingError
     elif status == ADBC_STATUS_NOT_IMPLEMENTED:
-        return NotSupportedError(message, vendor_code=vendor_code, sqlstate=sqlstate, details=details)
-    return klass(message, status_code=status, vendor_code=vendor_code, sqlstate=sqlstate, details=details)
+        return NotSupportedError(
+            message,
+            vendor_code=vendor_code,
+            sqlstate=sqlstate,
+            details=details,
+        )
+    return klass(
+        message,
+        status_code=status,
+        vendor_code=vendor_code,
+        sqlstate=sqlstate,
+        details=details,
+    )
 
 
 cdef void check_error(CAdbcStatusCode status, CAdbcError* error) except *:
@@ -307,6 +335,12 @@ cdef class _AdbcHandle:
                 raise RuntimeError(
                     f"Cannot close {self.__class__.__name__} "
                     f"with open {self._child_type}")
+
+
+def is_pycapsule(obj, bytes name) -> bool:
+    """Check if an object is a PyCapsule of a specific type."""
+    # Taken from nanoarrow
+    return PyCapsule_IsValid(obj, name) == 1
 
 
 cdef void pycapsule_schema_deleter(object capsule) noexcept:
@@ -403,6 +437,10 @@ cdef class ArrowArrayStreamHandle:
 
 
 class GetObjectsDepth(enum.IntEnum):
+    """
+    How much data to fetch for adbc_get_objects.
+    """
+
     ALL = ADBC_OBJECT_DEPTH_ALL
     CATALOGS = ADBC_OBJECT_DEPTH_CATALOGS
     DB_SCHEMAS = ADBC_OBJECT_DEPTH_DB_SCHEMAS
@@ -499,12 +537,10 @@ cdef class AdbcDatabase(_AdbcHandle):
         cdef CAdbcError c_error = empty_error()
         key_bytes = _to_bytes(key, "key")
         cdef char* c_key = key_bytes
-        cdef uint8_t* c_value = NULL
         cdef size_t c_len = 0
 
         buf = bytearray(1024)
         while True:
-            c_value = buf
             c_len = len(buf)
             check_error(
                 AdbcDatabaseGetOption(
@@ -532,12 +568,10 @@ cdef class AdbcDatabase(_AdbcHandle):
         cdef CAdbcError c_error = empty_error()
         key_bytes = _to_bytes(key, "key")
         cdef char* c_key = key_bytes
-        cdef uint8_t* c_value = NULL
         cdef size_t c_len = 0
 
         buf = bytearray(1024)
         while True:
-            c_value = buf
             c_len = len(buf)
             check_error(
                 AdbcDatabaseGetOptionBytes(
@@ -609,10 +643,20 @@ cdef class AdbcDatabase(_AdbcHandle):
                 c_value = value
                 status = AdbcDatabaseSetOption(
                     &self.database, c_key, c_value, &c_error)
+            elif isinstance(value, bool):
+                if value:
+                    value = ADBC_OPTION_VALUE_ENABLED
+                else:
+                    value = ADBC_OPTION_VALUE_DISABLED
+                value = _to_bytes(value, "option value")
+                c_value = value
+                status = AdbcDatabaseSetOption(
+                    &self.database, c_key, c_value, &c_error)
             elif isinstance(value, bytes):
                 c_value = value
                 status = AdbcDatabaseSetOptionBytes(
-                    &self.database, c_key, <const uint8_t*> c_value, len(value), &c_error)
+                    &self.database, c_key, <const uint8_t*> c_value,
+                    len(value), &c_error)
             elif isinstance(value, float):
                 status = AdbcDatabaseSetOptionDouble(
                     &self.database, c_key, value, &c_error)
@@ -797,12 +841,10 @@ cdef class AdbcConnection(_AdbcHandle):
         cdef CAdbcError c_error = empty_error()
         key_bytes = _to_bytes(key, "key")
         cdef char* c_key = key_bytes
-        cdef uint8_t* c_value = NULL
         cdef size_t c_len = 0
 
         buf = bytearray(1024)
         while True:
-            c_value = buf
             c_len = len(buf)
             check_error(
                 AdbcConnectionGetOption(
@@ -830,12 +872,10 @@ cdef class AdbcConnection(_AdbcHandle):
         cdef CAdbcError c_error = empty_error()
         key_bytes = _to_bytes(key, "key")
         cdef char* c_key = key_bytes
-        cdef uint8_t* c_value = NULL
         cdef size_t c_len = 0
 
         buf = bytearray(1024)
         while True:
-            c_value = buf
             c_len = len(buf)
             check_error(
                 AdbcConnectionGetOptionBytes(
@@ -996,10 +1036,20 @@ cdef class AdbcConnection(_AdbcHandle):
                 c_value = value
                 status = AdbcConnectionSetOption(
                     &self.connection, c_key, c_value, &c_error)
+            elif isinstance(value, bool):
+                if value:
+                    value = ADBC_OPTION_VALUE_ENABLED
+                else:
+                    value = ADBC_OPTION_VALUE_DISABLED
+                value = _to_bytes(value, "option value")
+                c_value = value
+                status = AdbcConnectionSetOption(
+                    &self.connection, c_key, c_value, &c_error)
             elif isinstance(value, bytes):
                 c_value = value
                 status = AdbcConnectionSetOptionBytes(
-                    &self.connection, c_key, <const uint8_t*> c_value, len(value), &c_error)
+                    &self.connection, c_key, <const uint8_t*> c_value,
+                    len(value), &c_error)
             elif isinstance(value, float):
                 status = AdbcConnectionSetOptionDouble(
                     &self.connection, c_key, value, &c_error)
@@ -1072,7 +1122,8 @@ cdef class AdbcStatement(_AdbcHandle):
         cdef CArrowArray* c_array
         cdef CArrowSchema* c_schema
 
-        if hasattr(data, "__arrow_c_array__") and not isinstance(data, ArrowArrayHandle):
+        if (hasattr(data, "__arrow_c_array__") and
+                not isinstance(data, ArrowArrayHandle)):
             if schema is not None:
                 raise ValueError(
                     "Can not provide a schema when passing Arrow-compatible "
@@ -1080,7 +1131,7 @@ cdef class AdbcStatement(_AdbcHandle):
                 )
             schema, data = data.__arrow_c_array__()
 
-        if PyCapsule_CheckExact(data):
+        if is_pycapsule(data, b"arrow_array"):
             c_array = <CArrowArray*> PyCapsule_GetPointer(data, "arrow_array")
         elif isinstance(data, ArrowArrayHandle):
             c_array = &(<ArrowArrayHandle> data).array
@@ -1092,7 +1143,7 @@ cdef class AdbcStatement(_AdbcHandle):
                 f"Protocol), a PyCapsule, int or ArrowArrayHandle, not {type(data)}"
             )
 
-        if PyCapsule_CheckExact(schema):
+        if is_pycapsule(schema, b"arrow_schema"):
             c_schema = <CArrowSchema*> PyCapsule_GetPointer(schema, "arrow_schema")
         elif isinstance(schema, ArrowSchemaHandle):
             c_schema = &(<ArrowSchemaHandle> schema).schema
@@ -1127,7 +1178,7 @@ cdef class AdbcStatement(_AdbcHandle):
         ):
             stream = stream.__arrow_c_stream__()
 
-        if PyCapsule_CheckExact(stream):
+        if is_pycapsule(stream, b"arrow_array_stream"):
             c_stream = <CArrowArrayStream*> PyCapsule_GetPointer(
                 stream, "arrow_array_stream"
             )
@@ -1190,7 +1241,8 @@ cdef class AdbcStatement(_AdbcHandle):
         check_error(status, &c_error)
         return (stream, rows_affected)
 
-    def execute_partitions(self) -> Tuple[List[bytes], ArrowSchemaHandle, int]:
+    def execute_partitions(self) -> \
+            Tuple[List[bytes], Optional[ArrowSchemaHandle], int]:
         """
         Execute the query and get the partitions of the result set.
 
@@ -1200,8 +1252,9 @@ cdef class AdbcStatement(_AdbcHandle):
         -------
         list of byte
             The partitions of the distributed result set.
-        ArrowSchemaHandle
-            The schema of the result set.
+        ArrowSchemaHandle or None
+            The schema of the result set.  May be None if incremental
+            execution is enabled and the server does not return a schema.
         int
             The number of rows if known, else -1.
         """
@@ -1227,7 +1280,9 @@ cdef class AdbcStatement(_AdbcHandle):
             partitions.append(PyBytes_FromStringAndSize(data, length))
         c_partitions.release(&c_partitions)
 
-        return (partitions, schema, rows_affected)
+        if schema.schema.release == NULL:
+            return partitions, None, rows_affected
+        return partitions, schema, rows_affected
 
     def execute_schema(self) -> ArrowSchemaHandle:
         """
@@ -1292,12 +1347,10 @@ cdef class AdbcStatement(_AdbcHandle):
         cdef CAdbcError c_error = empty_error()
         key_bytes = _to_bytes(key, "key")
         cdef char* c_key = key_bytes
-        cdef uint8_t* c_value = NULL
         cdef size_t c_len = 0
 
         buf = bytearray(1024)
         while True:
-            c_value = buf
             c_len = len(buf)
             check_error(
                 AdbcStatementGetOption(
@@ -1325,12 +1378,10 @@ cdef class AdbcStatement(_AdbcHandle):
         cdef CAdbcError c_error = empty_error()
         key_bytes = _to_bytes(key, "key")
         cdef char* c_key = key_bytes
-        cdef uint8_t* c_value = NULL
         cdef size_t c_len = 0
 
         buf = bytearray(1024)
         while True:
-            c_value = buf
             c_len = len(buf)
             check_error(
                 AdbcStatementGetOptionBytes(
@@ -1440,10 +1491,20 @@ cdef class AdbcStatement(_AdbcHandle):
                 c_value = value
                 status = AdbcStatementSetOption(
                     &self.statement, c_key, c_value, &c_error)
+            elif isinstance(value, bool):
+                if value:
+                    value = ADBC_OPTION_VALUE_ENABLED
+                else:
+                    value = ADBC_OPTION_VALUE_DISABLED
+                value = _to_bytes(value, "option value")
+                c_value = value
+                status = AdbcStatementSetOption(
+                    &self.statement, c_key, c_value, &c_error)
             elif isinstance(value, bytes):
                 c_value = value
                 status = AdbcStatementSetOptionBytes(
-                    &self.statement, c_key, <const uint8_t*> c_value, len(value), &c_error)
+                    &self.statement, c_key, <const uint8_t*> c_value,
+                    len(value), &c_error)
             elif isinstance(value, float):
                 status = AdbcStatementSetOptionDouble(
                     &self.statement, c_key, value, &c_error)
@@ -1479,5 +1540,99 @@ cdef class AdbcStatement(_AdbcHandle):
 
 
 cdef const CAdbcError* PyAdbcErrorFromArrayStream(
-    CArrowArrayStream* stream, CAdbcStatusCode* status):
+        CArrowArrayStream* stream, CAdbcStatusCode* status):
     return AdbcErrorFromArrayStream(stream, status)
+
+
+cdef extern from "_blocking_impl.h" nogil:
+    ctypedef void (*BlockingCallback)(void*) noexcept nogil
+    c_string CInitBlockingCallback"pyadbc_driver_manager::InitBlockingCallback"()
+    c_string CSetBlockingCallback"pyadbc_driver_manager::SetBlockingCallback"(
+        BlockingCallback, void* data)
+    c_string CClearBlockingCallback"pyadbc_driver_manager::ClearBlockingCallback"()
+
+
+@functools.lru_cache
+def _init_blocking_call():
+    error = bytes(CInitBlockingCallback()).decode("utf-8")
+    if error:
+        warnings.warn(
+            f"Failed to initialize KeyboardInterrupt support: {error}",
+            RuntimeWarning,
+        )
+
+
+_blocking_lock = threading.Lock()
+_blocking_exc = None
+
+
+def _blocking_call_impl(func, args, kwargs, cancel):
+    """
+    Run functions that are expected to block with a native SIGINT handler.
+
+    Parameters
+    ----------
+    """
+    global _blocking_exc
+
+    if threading.current_thread() is not threading.main_thread():
+        return func(*args, **kwargs)
+
+    _init_blocking_call()
+
+    with _blocking_lock:
+        if _blocking_exc:
+            _blocking_exc = None
+
+    # Set the callback for the background thread and save the signal handler
+    # TODO: ideally this would be no-op if already set
+    error = bytes(
+        CSetBlockingCallback(&_handle_blocking_call, <void*>cancel)
+    ).decode("utf-8")
+    if error:
+        warnings.warn(
+            f"Failed to set SIGINT handler: {error}",
+            RuntimeWarning,
+        )
+
+    try:
+        return func(*args, **kwargs)
+    except BaseException as e:
+        with _blocking_lock:
+            if _blocking_exc:
+                exc = _blocking_exc
+                _blocking_exc = None
+                raise e from exc[1].with_traceback(exc[2])
+        raise e
+    finally:
+        # Restore the signal handler
+        error = bytes(CClearBlockingCallback()).decode("utf-8")
+        if error:
+            warnings.warn(
+                f"Failed to restore SIGINT handler: {error}",
+                RuntimeWarning,
+            )
+        with _blocking_lock:
+            if _blocking_exc:
+                exc = _blocking_exc
+                _blocking_exc = None
+                raise exc[1].with_traceback(exc[2]) from KeyboardInterrupt
+
+
+if os.name != "nt":
+    # https://github.com/apache/arrow-adbc/issues/1522
+    _blocking_call = _blocking_call_impl
+else:
+    def _blocking_call(func, args, kwargs, cancel):
+        return func(*args, **kwargs)
+
+
+cdef void _handle_blocking_call(void* c_cancel) noexcept nogil:
+    with gil:
+        try:
+            cancel = <object> c_cancel
+            cancel()
+        except:  # no-cython-lint
+            with _blocking_lock:
+                global _blocking_exc
+                _blocking_exc = sys.exc_info()

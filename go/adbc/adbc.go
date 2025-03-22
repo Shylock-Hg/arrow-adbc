@@ -40,8 +40,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -244,6 +244,9 @@ const (
 	OptionValueIngestModeAppend       = "adbc.ingest.mode.append"
 	OptionValueIngestModeReplace      = "adbc.ingest.mode.replace"
 	OptionValueIngestModeCreateAppend = "adbc.ingest.mode.create_append"
+	OptionValueIngestTargetCatalog    = "adbc.ingest.target_catalog"
+	OptionValueIngestTargetDBSchema   = "adbc.ingest.target_db_schema"
+	OptionValueIngestTemporary        = "adbc.ingest.temporary"
 	OptionKeyURI                      = "uri"
 	OptionKeyUsername                 = "username"
 	OptionKeyPassword                 = "password"
@@ -284,15 +287,15 @@ const (
 	// approximate).
 	//
 	// For example, this is the maximum length of a string for a string column.
-	StatisticMaxByteWidthName = "adbc.statistic.byte_width"
+	StatisticMaxByteWidthName = "adbc.statistic.max_byte_width"
 	// The dictionary-encoded name of the max value statistic.
 	StatisticMaxValueKey = 3
 	// The max value statistic.  Value type is column-dependent.
-	StatisticMaxValueName = "adbc.statistic.byte_width"
+	StatisticMaxValueName = "adbc.statistic.max_value"
 	// The dictionary-encoded name of the min value statistic.
 	StatisticMinValueKey = 4
 	// The min value statistic.  Value type is column-dependent.
-	StatisticMinValueName = "adbc.statistic.byte_width"
+	StatisticMinValueName = "adbc.statistic.min_value"
 	// The dictionary-encoded name of the null count statistic.
 	StatisticNullCountKey = 5
 	// The null count statistic.  The number of values that are null in the
@@ -307,20 +310,19 @@ const (
 )
 
 // Driver is the entry point for the interface. It is similar to
-// database/sql.Driver taking a map of keys and values as options
-// to initialize a Connection to the database. Any common connection
+// [database/sql.Driver] taking a map of keys and values as options
+// to initialize a [Connection] to the database. Any common connection
 // state can live in the Driver itself, for example an in-memory database
 // can place ownership of the actual database in this driver.
 //
 // Any connection specific options should be set using SetOptions before
 // calling Open.
 //
-// The provided context.Context is for dialing purposes only
-// (see net.DialContext) and should not be stored or used for other purposes.
+// The provided [context.Context] is for dialing purposes only.
 // A default timeout should still be used when dialing as a connection
 // pool may call Connect asynchronously to any query.
 //
-// A driver can also optionally implement io.Closer if there is a need
+// A driver can also optionally implement [io.Closer] if there is a need
 // or desire for it.
 type Driver interface {
 	NewDatabase(opts map[string]string) (Database, error)
@@ -344,7 +346,14 @@ const (
 	InfoVendorVersion InfoCode = 1 // VendorVersion
 	// The database vendor/product Arrow library version (type: utf8)
 	InfoVendorArrowVersion InfoCode = 2 // VendorArrowVersion
-
+	// Indicates whether SQL queries are supported (type: bool).
+	InfoVendorSql InfoCode = 3
+	// Indicates whether Substrait queries are supported (type: bool).
+	InfoVendorSubstrait InfoCode = 4
+	// The minimum supported Substrait version, or null if Substrait is not supported (type: utf8).
+	InfoVendorSubstraitMinVersion InfoCode = 5
+	// The maximum supported Substrait version, or null if Substrait is not supported (type: utf8).
+	InfoVendorSubstraitMaxVersion InfoCode = 6
 	// The driver name (type: utf8)
 	InfoDriverName InfoCode = 100 // DriverName
 	// The driver version (type: utf8)
@@ -353,6 +362,17 @@ const (
 	InfoDriverArrowVersion InfoCode = 102 // DriverArrowVersion
 	// The driver ADBC API version (type: int64)
 	InfoDriverADBCVersion InfoCode = 103 // DriverADBCVersion
+)
+
+type InfoValueTypeCode = arrow.UnionTypeCode
+
+const (
+	InfoValueStringType              InfoValueTypeCode = 0
+	InfoValueBooleanType             InfoValueTypeCode = 1
+	InfoValueInt64Type               InfoValueTypeCode = 2
+	InfoValueInt32BitmaskType        InfoValueTypeCode = 3
+	InfoValueStringListType          InfoValueTypeCode = 4
+	InfoValueInt32ToInt32ListMapType InfoValueTypeCode = 5
 )
 
 type ObjectDepth int
