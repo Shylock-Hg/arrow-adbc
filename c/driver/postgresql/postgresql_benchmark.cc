@@ -20,7 +20,7 @@
 #include <benchmark/benchmark.h>
 #include <nanoarrow/nanoarrow.hpp>
 
-#include "adbc.h"
+#include "arrow-adbc/adbc.h"
 #include "validation/adbc_validation_util.h"
 
 #define _ADBC_BENCHMARK_RETURN_NOT_OK_IMPL(NAME, EXPR) \
@@ -207,8 +207,8 @@ static void BM_PostgresqlDecimalWrite(benchmark::State& state) {
   }
 
   for (size_t i = 0; i < ncols; i++) {
-    if (AdbcNsArrowSchemaSetTypeDecimal(schema.value.children[i], type, precision,
-                                        scale) != NANOARROW_OK) {
+    if (PrivateArrowSchemaSetTypeDecimal(schema.value.children[i], type, precision,
+                                         scale) != NANOARROW_OK) {
       state.SkipWithError("Call to ArrowSchemaSetTypeDecimal failed!");
       error.release(&error);
       return;

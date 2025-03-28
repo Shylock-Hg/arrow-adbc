@@ -33,6 +33,7 @@ add_arrow_lib(adbc_driver_postgresql
               database.cc
               postgresql.cc
               result_helper.cc
+              result_reader.cc
               statement.cc
               OUTPUTS
               ADBC_LIBRARIES
@@ -44,22 +45,19 @@ add_arrow_lib(adbc_driver_postgresql
               ${ADBC_LINK_FLAGS}
               SHARED_LINK_LIBS
               adbc_driver_common
-              nanoarrow
+              adbc_driver_framework
               ${LIBPQ_LINK_LIBRARIES}
               STATIC_LINK_LIBS
               ${LIBPQ_LINK_LIBRARIES}
               adbc_driver_common
-              nanoarrow
+              adbc_driver_framework
               ${LIBPQ_STATIC_LIBRARIES})
 
 foreach(LIB_TARGET ${ADBC_LIBRARIES})
   target_compile_definitions(${LIB_TARGET} PRIVATE ADBC_EXPORTING)
   target_include_directories(${LIB_TARGET} SYSTEM
-                             PRIVATE ${REPOSITORY_ROOT}
-                                     ${REPOSITORY_ROOT}/c/
-                                     ${LIBPQ_INCLUDE_DIRS}
-                                     ${REPOSITORY_ROOT}/c/vendor
-                                     ${REPOSITORY_ROOT}/c/driver)
+                             PRIVATE ${REPOSITORY_ROOT}/c/ ${REPOSITORY_ROOT}/c/include/
+                                     ${LIBPQ_INCLUDE_DIRS} ${REPOSITORY_ROOT}/c/driver)
 endforeach()
 
 if(ADBC_TEST_LINKAGE STREQUAL "shared")
@@ -80,15 +78,11 @@ if(ADBC_BUILD_TESTS)
                 EXTRA_LINK_LIBS
                 adbc_driver_common
                 adbc_validation
-                nanoarrow
                 ${TEST_LINK_LIBS})
   target_compile_features(adbc-driver-postgresql-test PRIVATE cxx_std_17)
   target_include_directories(adbc-driver-postgresql-test SYSTEM
-                             PRIVATE ${REPOSITORY_ROOT}
-                                     ${REPOSITORY_ROOT}/c/
-                                     ${LIBPQ_INCLUDE_DIRS}
-                                     ${REPOSITORY_ROOT}/c/vendor
-                                     ${REPOSITORY_ROOT}/c/driver)
+                             PRIVATE ${REPOSITORY_ROOT}/c/ ${REPOSITORY_ROOT}/c/include/
+                                     ${LIBPQ_INCLUDE_DIRS} ${REPOSITORY_ROOT}/c/driver)
   adbc_configure_target(adbc-driver-postgresql-test)
 
   add_test_case(driver_postgresql_copy_test
@@ -102,15 +96,11 @@ if(ADBC_BUILD_TESTS)
                 EXTRA_LINK_LIBS
                 adbc_driver_common
                 adbc_validation
-                nanoarrow
                 ${TEST_LINK_LIBS})
   target_compile_features(adbc-driver-postgresql-copy-test PRIVATE cxx_std_17)
   target_include_directories(adbc-driver-postgresql-copy-test SYSTEM
-                             PRIVATE ${REPOSITORY_ROOT}
-                                     ${REPOSITORY_ROOT}/c/
-                                     ${LIBPQ_INCLUDE_DIRS}
-                                     ${REPOSITORY_ROOT}/c/vendor
-                                     ${REPOSITORY_ROOT}/c/driver)
+                             PRIVATE ${REPOSITORY_ROOT}/c/ ${REPOSITORY_ROOT}/c/include/
+                                     ${LIBPQ_INCLUDE_DIRS} ${REPOSITORY_ROOT}/c/driver)
   adbc_configure_target(adbc-driver-postgresql-copy-test)
 endif()
 
@@ -121,12 +111,10 @@ if(ADBC_BUILD_BENCHMARKS)
                 EXTRA_LINK_LIBS
                 adbc_driver_common
                 adbc_validation
-                nanoarrow
                 ${TEST_LINK_LIBS}
                 benchmark::benchmark)
   # add_benchmark replaces _ with - when creating target
   target_include_directories(postgresql-benchmark
-                             PRIVATE ${REPOSITORY_ROOT} ${REPOSITORY_ROOT}/c/
-                                     ${REPOSITORY_ROOT}/c/vendor
+                             PRIVATE ${REPOSITORY_ROOT}/c/ ${REPOSITORY_ROOT}/c/include/
                                      ${REPOSITORY_ROOT}/c/driver)
 endif()

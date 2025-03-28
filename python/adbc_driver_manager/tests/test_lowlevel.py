@@ -80,7 +80,7 @@ def test_error_mapping():
     ]
 
     message = "Message"
-    for (klass, code) in cases:
+    for klass, code in cases:
         with pytest.raises(klass) as exc_info:
             _lib._test_error(code, message, vendor_code=None, sqlstate=None)
         assert message in exc_info.value.args[0]
@@ -101,7 +101,7 @@ def test_database_set_options(sqlite):
     db, _ = sqlite
     with pytest.raises(
         adbc_driver_manager.NotSupportedError,
-        match="Unknown database option foo=bar",
+        match="Unknown database option foo='bar'",
     ):
         db.set_options(foo="bar")
 
@@ -204,7 +204,7 @@ def test_connection_set_options(sqlite):
     _, conn = sqlite
     with pytest.raises(
         adbc_driver_manager.NotSupportedError,
-        match="Unknown connection option foo=bar",
+        match="Unknown connection option foo='bar'",
     ):
         conn.set_options(foo="bar")
 
@@ -360,7 +360,7 @@ def test_statement_set_options(sqlite):
     with adbc_driver_manager.AdbcStatement(conn) as stmt:
         with pytest.raises(
             adbc_driver_manager.NotSupportedError,
-            match="Unknown statement option foo=bar",
+            match="Unknown statement option foo='bar'",
         ):
             stmt.set_options(foo="bar")
 
@@ -428,7 +428,7 @@ def test_pycapsule(sqlite):
     handle = conn.get_table_schema(catalog=None, db_schema=None, table_name="foo")
     assert data.schema == pyarrow.schema(handle)
     # ensure consumed schema was marked as such
-    with pytest.raises(ValueError, match="Cannot import released ArrowSchema"):
+    with pytest.raises(ValueError):
         pyarrow.schema(handle)
 
     # smoke test for the capsule calling release
@@ -454,7 +454,7 @@ def test_pycapsule(sqlite):
     assert result == table
 
     # ensure consumed schema was marked as such
-    with pytest.raises(ValueError, match="Cannot import released ArrowArrayStream"):
+    with pytest.raises(ValueError):
         pyarrow.table(handle)
 
     # smoke test for the capsule calling release

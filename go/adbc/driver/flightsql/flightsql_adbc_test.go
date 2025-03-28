@@ -35,6 +35,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -42,12 +44,12 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	driver "github.com/apache/arrow-adbc/go/adbc/driver/flightsql"
 	"github.com/apache/arrow-adbc/go/adbc/validation"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/flight"
-	"github.com/apache/arrow/go/v16/arrow/flight/flightsql"
-	"github.com/apache/arrow/go/v16/arrow/flight/flightsql/example"
-	"github.com/apache/arrow/go/v16/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/example"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
@@ -236,13 +238,14 @@ func (s *FlightSQLQuirks) SupportsConcurrentStatements() bool { return true }
 func (s *FlightSQLQuirks) SupportsCurrentCatalogSchema() bool { return false }
 
 // The driver supports it, but the server we use for testing does not.
-func (s *FlightSQLQuirks) SupportsExecuteSchema() bool           { return false }
-func (s *FlightSQLQuirks) SupportsGetSetOptions() bool           { return true }
-func (s *FlightSQLQuirks) SupportsPartitionedData() bool         { return true }
-func (s *FlightSQLQuirks) SupportsStatistics() bool              { return false }
-func (s *FlightSQLQuirks) SupportsTransactions() bool            { return true }
-func (s *FlightSQLQuirks) SupportsGetParameterSchema() bool      { return false }
-func (s *FlightSQLQuirks) SupportsDynamicParameterBinding() bool { return true }
+func (s *FlightSQLQuirks) SupportsErrorIngestIncompatibleSchema() bool { return true }
+func (s *FlightSQLQuirks) SupportsExecuteSchema() bool                 { return false }
+func (s *FlightSQLQuirks) SupportsGetSetOptions() bool                 { return true }
+func (s *FlightSQLQuirks) SupportsPartitionedData() bool               { return true }
+func (s *FlightSQLQuirks) SupportsStatistics() bool                    { return false }
+func (s *FlightSQLQuirks) SupportsTransactions() bool                  { return true }
+func (s *FlightSQLQuirks) SupportsGetParameterSchema() bool            { return false }
+func (s *FlightSQLQuirks) SupportsDynamicParameterBinding() bool       { return true }
 func (s *FlightSQLQuirks) GetMetadata(code adbc.InfoCode) interface{} {
 	switch code {
 	case adbc.InfoDriverName:
@@ -260,7 +263,7 @@ func (s *FlightSQLQuirks) GetMetadata(code adbc.InfoCode) interface{} {
 	case adbc.InfoVendorVersion:
 		return "sqlite 3"
 	case adbc.InfoVendorArrowVersion:
-		return "16.0.0-SNAPSHOT"
+		return arrow.PkgVersion
 	}
 
 	return nil
@@ -281,7 +284,7 @@ func (s *FlightSQLQuirks) SampleTableSchemaMetadata(tblName string, dt arrow.Dat
 	}
 }
 
-func (s *FlightSQLQuirks) Catalog() string  { return "" }
+func (s *FlightSQLQuirks) Catalog() string  { return "main" }
 func (s *FlightSQLQuirks) DBSchema() string { return "" }
 
 func TestADBCFlightSQL(t *testing.T) {
@@ -302,6 +305,78 @@ func TestADBCFlightSQL(t *testing.T) {
 	suite.Run(t, &TLSTests{Quirks: &FlightSQLQuirks{db: db}})
 	suite.Run(t, &ConnectionTests{})
 	suite.Run(t, &DomainSocketTests{db: db})
+}
+
+// Run the test suite, but validating that a header set on the database is ALWAYS passed
+
+type FlightSQLWithHeaderQuirks struct {
+	FlightSQLQuirks
+}
+
+func (s *FlightSQLWithHeaderQuirks) SetupDriver(t *testing.T) adbc.Driver {
+	var err error
+	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
+	// Enforce that a particular header is present on ALL requests
+	s.s = flight.NewServerWithMiddleware([]flight.ServerMiddleware{
+		{
+			Unary: func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+				if md, ok := metadata.FromIncomingContext(ctx); ok {
+					vals := md.Get("x-expected")
+					if slices.Contains(vals, "open sesame") {
+						return handler(ctx, req)
+					}
+				}
+				return nil, fmt.Errorf("missing expected header")
+			},
+			Stream: func(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+				ctx := stream.Context()
+				if md, ok := metadata.FromIncomingContext(ctx); ok {
+					vals := md.Get("x-expected")
+					if slices.Contains(vals, "open sesame") {
+						return handler(srv, stream)
+					}
+				}
+				return fmt.Errorf("missing expected header")
+			},
+		},
+	}, s.opts...)
+	require.NoError(t, err)
+	s.srv, err = example.NewSQLiteFlightSQLServer(s.db)
+	require.NoError(t, err)
+	s.srv.Alloc = s.mem
+
+	s.s.RegisterFlightService(flightsql.NewFlightServer(s.srv))
+	require.NoError(t, s.s.Init("localhost:0"))
+	s.s.SetShutdownOnSignals(os.Interrupt, os.Kill)
+	s.done = make(chan bool)
+	go func() {
+		defer close(s.done)
+		_ = s.s.Serve()
+	}()
+
+	return driver.NewDriver(s.mem)
+}
+
+func (s *FlightSQLWithHeaderQuirks) DatabaseOptions() map[string]string {
+	return map[string]string{
+		adbc.OptionKeyURI: "grpc+tcp://" + s.s.Addr().String(),
+		driver.OptionRPCCallHeaderPrefix + "x-expected": "open sesame",
+	}
+}
+
+func TestADBCFlightSQLWithHeader(t *testing.T) {
+	// XXX: arrow-go uses a shared DB so CreateDB can't be called more than once in a process
+	db, err := sql.Open("sqlite", "file:adbcwithheader?mode=memory&cache=private")
+	require.NoError(t, err)
+	defer db.Close()
+
+	q := &FlightSQLWithHeaderQuirks{FlightSQLQuirks{db: db}}
+	suite.Run(t, &validation.DatabaseTests{Quirks: q})
+	suite.Run(t, &validation.ConnectionTests{Quirks: q})
+	suite.Run(t, &validation.StatementTests{Quirks: q})
+	suite.Run(t, &OptionTests{Quirks: q})
+	suite.Run(t, &PartitionTests{Quirks: q})
+	suite.Run(t, &StatementTests{Quirks: q})
 }
 
 // Driver-specific tests
@@ -980,6 +1055,14 @@ type DomainSocketTests struct {
 }
 
 func (suite *DomainSocketTests) SetupSuite() {
+	// This doesn't appear to run under Windows
+	// transport: Error while dialing: dial unix
+	// /Users/RUNNER~1/AppData/Local/Temp/adbc-flight-sql-tests-1919020904/adbc.sock:
+	// connect: A socket operation encountered a dead network.
+	if runtime.GOOS == "windows" {
+		suite.T().Skip()
+	}
+
 	suite.alloc = memory.NewCheckedAllocator(memory.DefaultAllocator)
 
 	tempDir, err := os.MkdirTemp("", "adbc-flight-sql-tests-*")
@@ -1004,6 +1087,12 @@ func (suite *DomainSocketTests) SetupSuite() {
 
 	suite.ctx = context.Background()
 	suite.Driver = driver.NewDriver(suite.alloc)
+
+	if runtime.GOOS == "windows" {
+		// Remove drive letter and reverse slash directions in path
+		listenSocket = strings.ReplaceAll(listenSocket[2:], "\\", "/")
+	}
+
 	suite.DB, err = suite.Driver.NewDatabase(map[string]string{
 		adbc.OptionKeyURI: "grpc+unix://" + listenSocket,
 	})

@@ -19,57 +19,95 @@
 Driver Implementation Status
 ============================
 
+.. warning:: There is a known problem on macOS x86_64 when using two drivers
+             written in Go in the same process (unless working in a pure-Go
+             application), where using the second driver may crash.  For more
+             details, see `GH-1841
+             <https://github.com/apache/arrow-adbc/issues/1841>`_.
+
 Implementation Status
 =====================
 
 **Experimental** drivers are not feature-complete and the implementation is still progressing.
 **Beta** drivers are (mostly) feature-complete but have only been available for a short time.
-**Stable** drivers are feature-complete (as much as possible for the underlying database) and have been available/tested for a while.
+**Stable** drivers are (mostly) feature-complete (as much as possible for the underlying database) and have been available/tested for a while.
+
+.. note::
+
+   Drivers that support C/C++ can also be used from C#, GLib, Go, R, Ruby, and
+   Rust, regardless of their implementation language.
 
 .. list-table::
    :header-rows: 1
 
    * - Driver
-     - Supported Languages [#supported-languages]_
+     - Supported Languages
      - Implementation Language
      - Status
 
-   * - BigQuery
+   * - Apache DataFusion
+     - Rust
+     - Rust
+     - Experimental
+
+   * - BigQuery (C#)
      - C#
      - C#
      - Experimental
 
-   * - Flight SQL (Go)
-     - C, Go
+   * - BigQuery (Go)
+     - C/C++
      - Go
-     - Beta
+     - Experimental
+
+   * - DuckDB [#duckdb]_
+     - C/C++
+     - C++
+     - Stable
+
+   * - Flight SQL (Go)
+     - C/C++, C# [#wrapper]_
+     - Go
+     - Stable
 
    * - Flight SQL (Java)
      - Java
      - Java
      - Experimental
 
-   * - JDBC
+   * - JDBC Adapter
      - Java
      - Java
      - Experimental
 
    * - PostgreSQL
-     - C
+     - C/C++
      - C++
-     - Beta
+     - Stable
 
    * - SQLite
+     - C/C++
      - C
-     - C
-     - Beta
+     - Stable
 
    * - Snowflake
-     - C, Go
+     - C/C++, Rust [#wrapper]_
      - Go
+     - Stable
+
+   * - Thrift protocol-based [#thrift]_
+     - C#
+     - C#
      - Experimental
 
-.. [#supported-languages] C drivers are usable from Go, Python, and Ruby as well.
+.. [#duckdb] DuckDB is developed and provided by a third party.  See the
+             `DuckDB documentation
+             <https://duckdb.org/docs/stable/clients/adbc.html>`_ for details.
+
+.. [#thrift] Supports Apache Hive/Impala/Spark.
+
+.. [#wrapper] Listed separately because a wrapper package is provided that
+              combines the driver and the bindings for you.
 
 Feature Support
 ===============
@@ -82,14 +120,14 @@ Bulk Ingestion
     Does the driver support :ref:`bulk ingestion of data <specification-bulk-ingestion>` (creating or appending to a database table from an Arrow table)?
 
 Database Metadata
-    Does the driver support functions like :cpp:func:`AdbcConnectionGetObjects` that get metadata about the database catalog, etc.?
+    Does the driver support functions like :c:func:`AdbcConnectionGetObjects` that get metadata about the database catalog, etc.?
 
 Parameterized Queries
     Does the driver support binding query parameters?
 
 Partitioned Data
     Being able to read individual chunks of a (generally distributed)
-    result set (:cpp:func:`AdbcStatementExecutePartitions`).
+    result set (:c:func:`AdbcStatementExecutePartitions`).
 
 Prepared Statements
     Does the driver support binding query parameters?
@@ -149,6 +187,7 @@ Update Queries
    :header-rows: 1
 
    * - Driver
+     - Incremental Queries
      - Partitioned Data
      - Parameterized Queries
      - Prepared Statements
@@ -161,8 +200,10 @@ Update Queries
      - Y
      - Y
      - Y
+     - Y
 
    * - Flight SQL (Java)
+     - N
      - Y
      - Y
      - Y
@@ -171,6 +212,7 @@ Update Queries
 
    * - JDBC
      - N/A
+     - N/A
      - Y
      - Y
      - Y
@@ -178,17 +220,25 @@ Update Queries
 
    * - PostgreSQL
      - N/A
-     - Y
+     - N/A
+     - Y [#postgresql-prepared]_
      - Y
      - Y
      - Y
 
    * - SQLite
      - N/A
+     - N/A
      - Y
      - Y
      - Y
      - Y
+
+.. [#postgresql-prepared] The PostgreSQL driver only supports executing
+   prepared statements with parameters that do not return result sets
+   (basically, an INSERT with parameters).  Queries that return result sets
+   are difficult with prepared statements because the driver is built around
+   using COPY for best performance, which is not supported in this context.
 
 .. list-table:: Connection/database-level features
    :header-rows: 1
@@ -201,7 +251,7 @@ Update Queries
    * - Flight SQL (Go)
      - N
      - Y
-     - N
+     - Y
 
    * - Flight SQL (Java)
      - Y
@@ -216,7 +266,7 @@ Update Queries
    * - PostgreSQL
      - Y
      - Y
-     - N
+     - Y
 
    * - SQLite
      - Y

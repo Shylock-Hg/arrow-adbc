@@ -19,6 +19,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
@@ -31,13 +32,14 @@ namespace Apache.Arrow.Adbc.Client
     /// </summary>
     public sealed class AdbcConnection : DbConnection
     {
-        private AdbcDatabase adbcDatabase;
-        private Adbc.AdbcConnection adbcConnectionInternal;
+        private AdbcDatabase? adbcDatabase;
+        private Adbc.AdbcConnection? adbcConnectionInternal;
+        private TimeoutValue? connectionTimeoutValue;
 
         private readonly Dictionary<string, string> adbcConnectionParameters;
         private readonly Dictionary<string, string> adbcConnectionOptions;
 
-        private AdbcStatement adbcStatement;
+        private AdbcTransaction? currentTransaction;
 
         /// <summary>
         /// Overloaded. Intializes an <see cref="AdbcConnection"/>.
@@ -92,49 +94,76 @@ namespace Apache.Arrow.Adbc.Client
             this.adbcConnectionOptions = options;
         }
 
+        // For testing
+        internal AdbcConnection(AdbcDriver driver, AdbcDatabase database, Adbc.AdbcConnection connection)
+            : this(driver)
+        {
+            this.adbcDatabase = database;
+            this.adbcConnectionInternal = connection;
+        }
+
         /// <summary>
         /// Creates a new <see cref="AdbcCommand"/>.
         /// </summary>
         /// <returns><see cref="AdbcCommand"/></returns>
-        public new AdbcCommand CreateCommand() => CreateDbCommand() as AdbcCommand;
+        public new AdbcCommand CreateCommand() => (AdbcCommand)CreateDbCommand();
 
         /// <summary>
         /// Gets or sets the <see cref="AdbcDriver"/> associated with this
         /// connection.
         /// </summary>
-        public AdbcDriver AdbcDriver { get; set; }
+        public AdbcDriver? AdbcDriver { get; set; }
 
         /// <summary>
-        /// Gets the <see cref="AdbcStatement"/> associated with the
-        /// connection.
+        /// Creates an <see cref="AdbcStatement"/> for the connection.
         /// </summary>
-        internal AdbcStatement AdbcStatement
+        internal AdbcStatement CreateStatement()
         {
-            get
-            {
-                if (this.adbcStatement == null)
-                {
-                    // need to have a connection in order to have a statement
-                    EnsureConnectionOpen();
-                    this.adbcStatement = this.adbcConnectionInternal.CreateStatement();
-                }
-
-                return this.adbcStatement;
-            }
+            EnsureConnectionOpen();
+            return this.adbcConnectionInternal!.CreateStatement();
         }
 
-        public override string ConnectionString { get => GetConnectionString(); set => SetConnectionProperties(value); }
+        internal TimeoutValue? CommandTimeoutValue { get; private set; }
+
+#if NET5_0_OR_GREATER
+        [AllowNull]
+#endif
+        public override string ConnectionString { get => GetConnectionString(); set => SetConnectionProperties(value!); }
 
         /// <summary>
         /// Gets or sets the behavior of decimals.
         /// </summary>
         public DecimalBehavior DecimalBehavior { get; set; }
 
+        /// <summary>
+        /// Indicates how structs should be treated.
+        /// </summary>
+        public StructBehavior StructBehavior { get; set; } = StructBehavior.JsonString;
+
+        public override int ConnectionTimeout
+        {
+            get
+            {
+                if (connectionTimeoutValue != null)
+                    return connectionTimeoutValue.Value;
+                else
+                    return base.ConnectionTimeout;
+            }
+        }
+
         protected override DbCommand CreateDbCommand()
         {
             EnsureConnectionOpen();
 
-            return new AdbcCommand(this.AdbcStatement, this);
+            AdbcCommand cmd = new AdbcCommand(this);
+
+            if (CommandTimeoutValue != null)
+            {
+                cmd.AdbcCommandTimeoutProperty = CommandTimeoutValue.DriverPropertyName!;
+                cmd.CommandTimeout = CommandTimeoutValue.Value;
+            }
+
+            return cmd;
         }
 
         /// <summary>
@@ -150,7 +179,6 @@ namespace Apache.Arrow.Adbc.Client
         {
             this.adbcConnectionInternal?.Dispose();
             this.adbcConnectionInternal = null;
-            this.adbcStatement = null;
 
             base.Dispose(disposing);
         }
@@ -176,6 +204,10 @@ namespace Apache.Arrow.Adbc.Client
 
         public override void Close()
         {
+            if (this.currentTransaction != null)
+            {
+                this.currentTransaction.Rollback();
+            }
             this.Dispose();
         }
 
@@ -224,7 +256,31 @@ namespace Apache.Arrow.Adbc.Client
 
             foreach (string key in builder.Keys)
             {
-                this.adbcConnectionParameters.Add(key, Convert.ToString(builder[key]));
+                object? builderValue = builder[key];
+                if (builderValue != null)
+                {
+                    string paramValue = Convert.ToString(builderValue)!;
+
+                    switch (key)
+                    {
+                        case ConnectionStringKeywords.DecimalBehavior:
+                            this.DecimalBehavior = (DecimalBehavior)Enum.Parse(typeof(DecimalBehavior), paramValue);
+                            break;
+                        case ConnectionStringKeywords.StructBehavior:
+                            this.StructBehavior = (StructBehavior)Enum.Parse(typeof(StructBehavior), paramValue);
+                            break;
+                        case ConnectionStringKeywords.CommandTimeout:
+                            CommandTimeoutValue = ConnectionStringParser.ParseTimeoutValue(paramValue);
+                            break;
+                        case ConnectionStringKeywords.ConnectionTimeout:
+                            this.connectionTimeoutValue = ConnectionStringParser.ParseTimeoutValue(paramValue);
+                            this.adbcConnectionParameters[connectionTimeoutValue.DriverPropertyName] = connectionTimeoutValue.Value.ToString();
+                            break;
+                        default:
+                            this.adbcConnectionParameters.Add(key, paramValue);
+                            break;
+                    }
+                }
             }
         }
 
@@ -238,9 +294,9 @@ namespace Apache.Arrow.Adbc.Client
             return GetSchema(collectionName, null);
         }
 
-        public override DataTable GetSchema(string collectionName, string[] restrictionValues)
+        public override DataTable GetSchema(string collectionName, string?[]? restrictionValues)
         {
-            SchemaCollection collection;
+            SchemaCollection? collection;
             if (!SchemaCollection.TryGetCollection(collectionName, out collection))
             {
                 throw new ArgumentException(
@@ -248,14 +304,73 @@ namespace Apache.Arrow.Adbc.Client
                     nameof(collectionName));
             }
 
-            if (restrictionValues != null && restrictionValues.Length > collection.Restrictions.Length)
+            if (restrictionValues != null && restrictionValues.Length > collection!.Restrictions.Length)
             {
                 throw new ArgumentException(
                     $"More restrictions were provided than the requested schema ('{collectionName}') supports.",
                     nameof(restrictionValues));
             }
 
-            return collection.GetSchema(this.Connection, restrictionValues);
+            return collection!.GetSchema(this.Connection, restrictionValues);
+        }
+
+        protected override DbTransaction BeginDbTransaction(System.Data.IsolationLevel isolationLevel)
+        {
+            if (this.currentTransaction != null) throw new InvalidOperationException("connection is already enlisted in a transaction");
+
+            this.Connection.AutoCommit = false;
+
+            if (isolationLevel != System.Data.IsolationLevel.Unspecified)
+            {
+                this.Connection.IsolationLevel = GetIsolationLevel(isolationLevel);
+            }
+
+            this.currentTransaction = new AdbcTransaction(this, isolationLevel);
+            return this.currentTransaction;
+        }
+
+        private static Adbc.IsolationLevel GetIsolationLevel(System.Data.IsolationLevel isolationLevel)
+        {
+            return isolationLevel switch
+            {
+                System.Data.IsolationLevel.Unspecified => Adbc.IsolationLevel.Default,
+                System.Data.IsolationLevel.ReadUncommitted => Adbc.IsolationLevel.ReadUncommitted,
+                System.Data.IsolationLevel.ReadCommitted => Adbc.IsolationLevel.ReadCommitted,
+                System.Data.IsolationLevel.RepeatableRead => Adbc.IsolationLevel.RepeatableRead,
+                System.Data.IsolationLevel.Snapshot => Adbc.IsolationLevel.Snapshot,
+                System.Data.IsolationLevel.Serializable => Adbc.IsolationLevel.Serializable,
+                _ => throw new NotSupportedException("unknown isolation level"),
+            };
+        }
+
+        private void Commit()
+        {
+            if (this.currentTransaction == null) throw new InvalidOperationException("connection is not enlisted in a transaction");
+            System.Data.IsolationLevel isolationLevel = this.currentTransaction.IsolationLevel;
+
+            this.Connection.Commit();
+
+            this.currentTransaction = null;
+            this.Connection.AutoCommit = true;
+            if (isolationLevel != System.Data.IsolationLevel.Unspecified)
+            {
+                this.adbcConnectionInternal!.IsolationLevel = IsolationLevel.Default;
+            }
+        }
+
+        private void Rollback()
+        {
+            if (this.currentTransaction == null) throw new InvalidOperationException("connection is not enlisted in a transaction");
+            System.Data.IsolationLevel isolationLevel = this.currentTransaction.IsolationLevel;
+
+            this.Connection.Rollback();
+
+            this.currentTransaction = null;
+            this.Connection.AutoCommit = true;
+            if (isolationLevel != System.Data.IsolationLevel.Unspecified)
+            {
+                this.adbcConnectionInternal!.IsolationLevel = IsolationLevel.Default;
+            }
         }
 
         #region NOT_IMPLEMENTED
@@ -271,12 +386,26 @@ namespace Apache.Arrow.Adbc.Client
             throw new NotImplementedException();
         }
 
-        protected override DbTransaction BeginDbTransaction(System.Data.IsolationLevel isolationLevel)
-        {
-            throw new NotImplementedException();
-        }
-
         #endregion
+
+        sealed class AdbcTransaction : DbTransaction
+        {
+            readonly AdbcConnection connection;
+            readonly System.Data.IsolationLevel isolationLevel;
+
+            public AdbcTransaction(AdbcConnection connection, System.Data.IsolationLevel isolationLevel)
+            {
+                this.connection = connection;
+                this.isolationLevel = isolationLevel;
+            }
+
+            public override System.Data.IsolationLevel IsolationLevel => this.isolationLevel;
+
+            protected override DbConnection DbConnection => this.connection;
+
+            public override void Commit() => this.connection.Commit();
+            public override void Rollback() => this.connection.Rollback();
+        }
 
         abstract class SchemaCollection
         {
@@ -303,7 +432,7 @@ namespace Apache.Arrow.Adbc.Client
                 schemaCollections.Add(collection.Name, collection);
             }
 
-            public static bool TryGetCollection(string name, out SchemaCollection collection)
+            public static bool TryGetCollection(string name, out SchemaCollection? collection)
             {
                 return schemaCollections.TryGetValue(name, out collection);
             }
@@ -311,15 +440,15 @@ namespace Apache.Arrow.Adbc.Client
             public abstract string Name { get; }
             public abstract string[] Restrictions { get; }
 
-            public abstract DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string[] restrictions);
+            public abstract DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string?[]? restrictions);
         }
 
         private sealed class MetadataCollection : SchemaCollection
         {
             public override string Name => "MetaDataCollections";
-            public override string[] Restrictions => new string[0];
+            public override string[] Restrictions => [];
 
-            public override DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string[] restrictions)
+            public override DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string?[]? restrictions)
             {
                 DataTable result = new DataTable(Name);
                 result.Columns.Add("CollectionName", typeof(string));
@@ -337,9 +466,9 @@ namespace Apache.Arrow.Adbc.Client
         private sealed class RestrictionsCollection : SchemaCollection
         {
             public override string Name => "Restrictions";
-            public override string[] Restrictions => new string[0];
+            public override string[] Restrictions => [];
 
-            public override DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string[] restrictions)
+            public override DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string?[]? restrictions)
             {
                 var result = new DataTable(Name);
                 result.Columns.Add("CollectionName", typeof(string));
@@ -363,9 +492,9 @@ namespace Apache.Arrow.Adbc.Client
         {
             protected abstract MapItem[] Map { get; }
 
-            protected abstract IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string[] restrictions);
+            protected abstract IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string?[]? restrictions);
 
-            public override DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string[] restrictions)
+            public override DataTable GetSchema(Adbc.AdbcConnection adbcConnection, string?[]? restrictions)
             {
                 // Flattens the hierarchical ADBC schema into a DataTable
 
@@ -395,7 +524,7 @@ namespace Apache.Arrow.Adbc.Client
                                 {
                                     throw new InvalidOperationException($"Unable to find '{part}'");
                                 }
-                                ListType listType = types[i].GetFieldByIndex(index).DataType as ListType;
+                                ListType? listType = types[i].GetFieldByIndex(index).DataType as ListType;
                                 if (listType == null || listType.ValueDataType.TypeId != ArrowTypeId.Struct)
                                 {
                                     throw new InvalidOperationException($"Field '{part}' has unexpected type.");
@@ -422,7 +551,7 @@ namespace Apache.Arrow.Adbc.Client
                     State state = new State(result, indices.ToArray(), loaders.ToArray());
                     while (true)
                     {
-                        using (RecordBatch batch = stream.ReadNextRecordBatchAsync().Result)
+                        using (RecordBatch? batch = stream.ReadNextRecordBatchAsync().Result)
                         {
                             if (batch == null) { return result; }
 
@@ -437,7 +566,7 @@ namespace Apache.Arrow.Adbc.Client
                 private readonly DataTable table;
                 private readonly int[] indices;
                 private readonly Action<State>[] loaders;
-                private readonly object[] buffer;
+                private readonly object?[] buffer;
                 private readonly int[] offsets;
                 private readonly IArrowRecord[] records;
 
@@ -537,9 +666,9 @@ namespace Apache.Arrow.Adbc.Client
                 new MapItem("TABLE_CATALOG", new[] { "catalog_name" }, typeof(string)),
             };
 
-            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string[] restrictions)
+            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string?[]? restrictions)
             {
-                string catalog = restrictions?.Length > 0 ? restrictions[0] : null;
+                string? catalog = restrictions?.Length > 0 ? restrictions[0] : null;
                 return connection.GetObjects(GetObjectsDepth.Catalogs, catalog, null, null, null, null);
             }
         }
@@ -555,10 +684,10 @@ namespace Apache.Arrow.Adbc.Client
                 new MapItem("TABLE_SCHEMA", new [] { "catalog_db_schemas", "db_schema_name" }, typeof(string)),
             };
 
-            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string[] restrictions)
+            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string?[]? restrictions)
             {
-                string catalog = restrictions?.Length > 0 ? restrictions[0] : null;
-                string schema = restrictions?.Length > 1 ? restrictions[1] : null;
+                string? catalog = restrictions?.Length > 0 ? restrictions[0] : null;
+                string? schema = restrictions?.Length > 1 ? restrictions[1] : null;
                 return connection.GetObjects(GetObjectsDepth.DbSchemas, catalog, schema, null, null, null);
             }
         }
@@ -566,14 +695,14 @@ namespace Apache.Arrow.Adbc.Client
         private class TableTypesCollection : ArrowCollection
         {
             public override string Name => "TableTypes";
-            public override string[] Restrictions => new string[0];
+            public override string[] Restrictions => [];
 
             protected override MapItem[] Map => new[]
             {
                 new MapItem("TABLE_TYPE", new [] { "table_type" }, typeof(string)),
             };
 
-            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string[] restrictions)
+            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string?[]? restrictions)
             {
                 return connection.GetTableTypes();
             }
@@ -592,12 +721,12 @@ namespace Apache.Arrow.Adbc.Client
                 new MapItem("TABLE_TYPE", new [] { "catalog_db_schemas", "db_schema_tables", "table_type" }, typeof(string)),
             };
 
-            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string[] restrictions)
+            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string?[]? restrictions)
             {
-                string catalog = restrictions?.Length > 0 ? restrictions[0] : null;
-                string schema = restrictions?.Length > 1 ? restrictions[1] : null;
-                string table = restrictions?.Length > 2 ? restrictions[2] : null;
-                List<string> tableTypes = restrictions?.Length > 3 ? restrictions[3].Split(',').ToList() : null;
+                string? catalog = restrictions?.Length > 0 ? restrictions[0] : null;
+                string? schema = restrictions?.Length > 1 ? restrictions[1] : null;
+                string? table = restrictions?.Length > 2 ? restrictions[2] : null;
+                List<string>? tableTypes = restrictions?.Length > 3 ? restrictions[3]?.Split(',').ToList() : null;
                 return connection.GetObjects(GetObjectsDepth.Tables, catalog, schema, table, tableTypes, null);
             }
         }
@@ -627,12 +756,12 @@ namespace Apache.Arrow.Adbc.Client
                 new MapItem("DATETIME_PRECISION", new [] { "catalog_db_schemas", "db_schema_tables", "table_columns", "xdbc_datetime_sub" }, typeof(short)),
             };
 
-            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string[] restrictions)
+            protected override IArrowArrayStream Invoke(Adbc.AdbcConnection connection, string?[]? restrictions)
             {
-                string catalog = restrictions?.Length > 0 ? restrictions[0] : null;
-                string schema = restrictions?.Length > 1 ? restrictions[1] : null;
-                string table = restrictions?.Length > 2 ? restrictions[2] : null;
-                string column = restrictions?.Length > 3 ? restrictions[3] : null;
+                string? catalog = restrictions?.Length > 0 ? restrictions[0] : null;
+                string? schema = restrictions?.Length > 1 ? restrictions[1] : null;
+                string? table = restrictions?.Length > 2 ? restrictions[2] : null;
+                string? column = restrictions?.Length > 3 ? restrictions[3] : null;
                 return connection.GetObjects(GetObjectsDepth.All, catalog, schema, table, null, column);
             }
         }
