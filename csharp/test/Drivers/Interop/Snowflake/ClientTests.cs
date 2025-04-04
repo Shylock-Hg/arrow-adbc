@@ -143,6 +143,37 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
         }
 
         // <summary>
+        /// Validates if the client can connect to a live server and execute a parameterized query.
+        /// </summary>
+        [SkippableFact, Order(4)]
+        public void CanClientExecuteParameterizedQuery()
+        {
+            SnowflakeTestConfiguration testConfiguration = Utils.LoadTestConfiguration<SnowflakeTestConfiguration>(SnowflakeTestingUtils.SNOWFLAKE_TEST_CONFIG_VARIABLE);
+            testConfiguration.Query = "SELECT ? as A, ? as B, ? as C, * FROM (SELECT column1 FROM (VALUES (1), (2), (3))) WHERE column1 < ?";
+            testConfiguration.ExpectedResultsCount = 1;
+
+            using (Adbc.Client.AdbcConnection adbcConnection = GetSnowflakeAdbcConnectionUsingConnectionString(testConfiguration))
+            {
+                Tests.ClientTests.CanClientExecuteQuery(adbcConnection, testConfiguration, command =>
+                {
+                    DbParameter CreateParameter(DbType dbType, object value)
+                    {
+                        DbParameter result = command.CreateParameter();
+                        result.DbType = dbType;
+                        result.Value = value;
+                        return result;
+                    }
+
+                    // TODO: Add tests for decimal and time once supported by the driver or gosnowflake
+                    command.Parameters.Add(CreateParameter(DbType.Int32, 2));
+                    command.Parameters.Add(CreateParameter(DbType.String, "text"));
+                    command.Parameters.Add(CreateParameter(DbType.Double, 2.5));
+                    command.Parameters.Add(CreateParameter(DbType.Int32, 2));
+                });
+            }
+        }
+
+        // <summary>
         /// Validates if the client can connect to a live server
         /// and parse the results.
         /// </summary>
@@ -230,8 +261,8 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
                 Assert.Equal(3, restrictions.Columns.Count);
 
                 var catalogs = adbcConnection.GetSchema("Catalogs");
-                Assert.Equal(1, catalogs.Columns.Count);
-                var catalog = (string)catalogs.Rows[0].ItemArray[0];
+                Assert.Single(catalogs.Columns);
+                var catalog = (string?)catalogs.Rows[0].ItemArray[0];
 
                 catalogs = adbcConnection.GetSchema("Catalogs", new[] { catalog });
                 Assert.Equal(1, catalogs.Rows.Count);
@@ -244,7 +275,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
                 Assert.Equal(1, schemas.Rows.Count);
 
                 var tableTypes = adbcConnection.GetSchema("TableTypes");
-                Assert.Equal(1, tableTypes.Columns.Count);
+                Assert.Single(tableTypes.Columns);
 
                 var tables = adbcConnection.GetSchema("Tables", new[] { catalog, schema });
                 Assert.Equal(4, tables.Columns.Count);
@@ -256,7 +287,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             }
         }
 
-        private Adbc.Client.AdbcConnection GetSnowflakeAdbcConnectionUsingConnectionString(SnowflakeTestConfiguration testConfiguration, string authType = null)
+        private Adbc.Client.AdbcConnection GetSnowflakeAdbcConnectionUsingConnectionString(SnowflakeTestConfiguration testConfiguration, string? authType = null)
         {
             // see https://arrow.apache.org/adbc/0.5.1/driver/snowflake.html
 
@@ -268,7 +299,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             builder[SnowflakeParameters.USERNAME] = testConfiguration.User;
             if (authType == SnowflakeAuthentication.AuthJwt)
             {
-                string privateKey = testConfiguration.Authentication.SnowflakeJwt.PrivateKey;
+                string privateKey = testConfiguration.Authentication.SnowflakeJwt!.PrivateKey;
                 builder[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthJwt;
                 builder[SnowflakeParameters.PKCS8_VALUE] = privateKey;
                 builder[SnowflakeParameters.USERNAME] = testConfiguration.Authentication.SnowflakeJwt.User;
@@ -280,7 +311,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             else if (authType == SnowflakeAuthentication.AuthOAuth)
             {
                 builder[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthOAuth;
-                builder[SnowflakeParameters.AUTH_TOKEN] = testConfiguration.Authentication.OAuth.Token;
+                builder[SnowflakeParameters.AUTH_TOKEN] = testConfiguration.Authentication.OAuth!.Token;
                 if (testConfiguration.Authentication.OAuth.User != null)
                 {
                     builder[SnowflakeParameters.USERNAME] = testConfiguration.Authentication.OAuth.User;
@@ -290,7 +321,7 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Interop.Snowflake
             {
                 // if no auth type is specified, use the snowflake auth
                 builder[SnowflakeParameters.AUTH_TYPE] = SnowflakeAuthentication.AuthSnowflake;
-                builder[SnowflakeParameters.USERNAME] = testConfiguration.Authentication.Default.User;
+                builder[SnowflakeParameters.USERNAME] = testConfiguration.Authentication.Default!.User;
                 builder[SnowflakeParameters.PASSWORD] = testConfiguration.Authentication.Default.Password;
             }
             AdbcDriver snowflakeDriver = SnowflakeTestingUtils.GetSnowflakeAdbcDriver(testConfiguration);
