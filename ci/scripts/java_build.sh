@@ -34,13 +34,9 @@ main() {
 
     echo "=== Build ==="
     pushd ${source_dir}/java
-    mvn clean \
+    mvn -B clean \
         install \
-        assembly:single \
-        source:jar \
-        javadoc:jar \
         -Papache-release \
-        -DdescriptorId=source-release \
         -T 2C \
         -DskipTests \
         -Dgpg.skip

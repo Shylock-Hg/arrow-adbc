@@ -45,7 +45,26 @@ namespace Apache.Arrow.Adbc.Tests
         /// <summary>
         /// The query to run.
         /// </summary>
-        public string Query { get; set; }
+        public string Query { get; set; } = string.Empty;
+
+        /// <summary>
+        /// A set of commands to run before the query.
+        /// </summary>
+        public List<string> PreQueryCommands { get; set; } = new List<string>();
+
+        /// <summary>
+        /// A set of commands to run after the query.
+        /// </summary>
+        public List<string> PostQueryCommands { get; set; } = new List<string>();
+
+        /// <summary>
+        /// Optional value to indicate how structs should be treated in the sample data.
+        /// </summary>
+        /// <example>
+        /// JsonString
+        /// Strict
+        /// </example>
+        public string? StructBehavior { get; set; }
 
         /// <summary>
         /// The expected values.

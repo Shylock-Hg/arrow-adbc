@@ -20,8 +20,9 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 #include "nanoarrow/nanoarrow.h"
 
 #ifdef __cplusplus
@@ -52,6 +53,7 @@ void AppendErrorDetail(struct AdbcError* error, const char* key, const uint8_t* 
 
 int CommonErrorGetDetailCount(const struct AdbcError* error);
 struct AdbcErrorDetail CommonErrorGetDetail(const struct AdbcError* error, int index);
+bool IsCommonError(const struct AdbcError* error);
 
 struct StringBuilder {
   char* buffer;
@@ -66,11 +68,6 @@ int ADBC_CHECK_PRINTF_ATTRIBUTE StringBuilderAppend(struct StringBuilder* builde
 void StringBuilderReset(struct StringBuilder* builder);
 
 #undef ADBC_CHECK_PRINTF_ATTRIBUTE
-
-/// Wrap a single batch as a stream.
-AdbcStatusCode BatchToArrayStream(struct ArrowArray* values, struct ArrowSchema* schema,
-                                  struct ArrowArrayStream* stream,
-                                  struct AdbcError* error);
 
 /// Check an NanoArrow status code.
 #define CHECK_NA(CODE, EXPR, ERROR)                                                 \
@@ -117,27 +114,6 @@ AdbcStatusCode BatchToArrayStream(struct ArrowArray* values, struct ArrowSchema*
     AdbcStatusCode adbc_status_code = (EXPR);                        \
     if (adbc_status_code != ADBC_STATUS_OK) return adbc_status_code; \
   } while (0)
-
-/// \defgroup adbc-connection-utils Connection Utilities
-/// Utilities for implementing connection-related functions for drivers
-///
-/// @{
-AdbcStatusCode AdbcInitConnectionGetInfoSchema(const uint32_t* info_codes,
-                                               size_t info_codes_length,
-                                               struct ArrowSchema* schema,
-                                               struct ArrowArray* array,
-                                               struct AdbcError* error);
-AdbcStatusCode AdbcConnectionGetInfoAppendString(struct ArrowArray* array,
-                                                 uint32_t info_code,
-                                                 const char* info_value,
-                                                 struct AdbcError* error);
-AdbcStatusCode AdbcConnectionGetInfoAppendInt(struct ArrowArray* array,
-                                              uint32_t info_code, int64_t info_value,
-                                              struct AdbcError* error);
-
-AdbcStatusCode AdbcInitConnectionObjectsSchema(struct ArrowSchema* schema,
-                                               struct AdbcError* error);
-/// @}
 
 struct AdbcGetObjectsUsage {
   struct ArrowStringView fk_catalog;

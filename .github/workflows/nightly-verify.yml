@@ -18,12 +18,26 @@
 name: Verification (Nightly)
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-verify.yml"
+      - "ci/docker/cpp-clang-latest.dockerfile"
+      - "ci/docker/cpp-gcc-latest.dockerfile"
+      - "dev/release/verify-release-candidate.sh"
+      - "dev/release/verify-release-candidate.ps1"
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    # 'bash' will expand to -eo pipefail
+    shell: bash
 
 jobs:
   source:
@@ -34,16 +48,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
 
       - name: Prepare version
-        shell: bash
         run: |
           VERSION=$(grep 'set(ADBC_VERSION' c/cmake_modules/AdbcVersion.cmake | \
                       grep -E -o '[0-9]+\.[0-9]+\.[0-9]+')
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
       - name: Create archive
-        shell: bash
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
@@ -55,7 +69,6 @@ jobs:
             apache-arrow-adbc-${VERSION}-rc0
 
       - name: Create fake GPG key
-        shell: bash
         run: |
           gpg \
             --quick-gen-key \
@@ -71,7 +84,6 @@ jobs:
             --export >> KEYS
 
       - name: Create sum/signature
-        shell: bash
         run: |
           gpg \
             --armor \
@@ -82,7 +94,7 @@ jobs:
           shasum --algorithm 512 \
             apache-arrow-adbc-${VERSION}.tar.gz > apache-arrow-adbc-${VERSION}.tar.gz.sha512
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: source
           retention-days: 7
@@ -100,7 +112,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["macos-latest", "ubuntu-latest", "windows-latest"]
+        os: ["macos-13", "macos-latest", "ubuntu-latest", "windows-latest"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -109,33 +121,36 @@ jobs:
           persist-credentials: false
 
       - name: Prepare version
-        shell: bash
         run: |
           VERSION=$(grep 'set(ADBC_VERSION' arrow-adbc/c/cmake_modules/AdbcVersion.cmake | \
                       grep -E -o '[0-9]+\.[0-9]+\.[0-9]+')
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: source
           path: ${{ github.workspace }}/apache-arrow-adbc-${{ env.VERSION }}-rc0/
 
       - name: Setup directory structure
-        shell: bash
         run: |
           mv apache-arrow-adbc-${{ env.VERSION }}-rc0/KEYS .
 
-      - uses: conda-incubator/setup-miniconda@v3
+      - uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830  # v3.1.1
         # The Unix script will set up conda itself
         if: matrix.os == 'windows-latest'
         with:
-          miniforge-variant: Mambaforge
           miniforge-version: latest
           use-mamba: true
+
+      - name: Work around ASAN issue (GH-1617)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo sysctl vm.mmap_rnd_bits=28
 
       - name: Verify
         if: matrix.os != 'windows-latest'
         env:
+          CI: "false"
           REPOSITORY: ${{ github.repository }}
           TEST_DEFAULT: "0"
           TEST_SOURCE: "1"
@@ -143,12 +158,16 @@ jobs:
           VERBOSE: "1"
           VERIFICATION_MOCK_DIST_DIR: ${{ github.workspace }}
         run: |
+          # Rust uses a lot of disk space, free up some space
+          # https://github.com/actions/runner-images/issues/2840
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           ./arrow-adbc/dev/release/verify-release-candidate.sh $VERSION 0
 
       - name: Verify
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
+          CI: "false"
           REPOSITORY: ${{ github.repository }}
           TEST_DEFAULT: "0"
           TEST_SOURCE: "1"
@@ -157,3 +176,28 @@ jobs:
           VERIFICATION_MOCK_DIST_DIR: ${{ github.workspace }}\apache-arrow-adbc-${{ env.VERSION }}-rc0
         run: |
           .\arrow-adbc\dev\release\verify-release-candidate.ps1 $env:VERSION 0
+
+  source-docker:
+    name: "Run Docker Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: arrow-adbc
+          persist-credentials: false
+
+      - name: cpp-clang-latest
+        run: |
+          pushd arrow-adbc
+          docker compose run --rm cpp-clang-latest
+
+      - name: cpp-gcc-latest
+        run: |
+          pushd arrow-adbc
+          docker compose run --rm cpp-gcc-latest
+
+      - name: python-debug
+        run: |
+          pushd arrow-adbc
+          docker compose run -e PYTHON=3.12 --rm python-debug

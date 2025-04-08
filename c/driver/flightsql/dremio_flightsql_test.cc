@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <adbc.h>
+#include <string>
+
+#include <arrow-adbc/adbc.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest-matchers.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
 #include <nanoarrow/nanoarrow.h>
+
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -30,13 +33,18 @@ class DremioFlightSqlQuirks : public adbc_validation::DriverQuirks {
  public:
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
                                struct AdbcError* error) const override {
-    const char* uri = std::getenv("ADBC_DREMIO_FLIGHTSQL_URI");
-    const char* user = std::getenv("ADBC_DREMIO_FLIGHTSQL_USER");
-    const char* pass = std::getenv("ADBC_DREMIO_FLIGHTSQL_PASS");
-    EXPECT_THAT(AdbcDatabaseSetOption(database, "uri", uri, error), IsOkStatus(error));
-    EXPECT_THAT(AdbcDatabaseSetOption(database, "username", user, error),
+    const char* uri_raw = std::getenv("ADBC_DREMIO_FLIGHTSQL_URI");
+    const char* user_raw = std::getenv("ADBC_DREMIO_FLIGHTSQL_USER");
+    const char* pass_raw = std::getenv("ADBC_DREMIO_FLIGHTSQL_PASS");
+    if (!uri_raw || !user_raw || !pass_raw) {
+      SetError(error, "Missing required environment variables");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    EXPECT_THAT(AdbcDatabaseSetOption(database, "uri", uri_raw, error),
                 IsOkStatus(error));
-    EXPECT_THAT(AdbcDatabaseSetOption(database, "password", pass, error),
+    EXPECT_THAT(AdbcDatabaseSetOption(database, "username", user_raw, error),
+                IsOkStatus(error));
+    EXPECT_THAT(AdbcDatabaseSetOption(database, "password", pass_raw, error),
                 IsOkStatus(error));
     return ADBC_STATUS_OK;
   }
@@ -92,6 +100,7 @@ class DremioFlightSqlStatementTest : public ::testing::Test,
   void TestSqlIngestColumnEscaping() {
     GTEST_SKIP() << "Column escaping not implemented";
   }
+  void TestSqlQueryEmpty() { GTEST_SKIP() << "Dremio doesn't support 'acceptPut'"; }
   void TestSqlQueryRowsAffectedDelete() {
     GTEST_SKIP() << "Cannot query rows affected in delete (not implemented)";
   }

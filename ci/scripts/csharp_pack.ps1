@@ -13,20 +13,32 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-
+[CmdletBinding(PositionalBinding=$false)]
 param (
-    [string]$destination=$null
+    [string]$destination=$null,
+    [string]$versionSuffix=$null,
+    [switch]$noBuild
 )
 
-$loc = Get-Location
+$csharpFolder = [IO.Path]::Combine($PSScriptRoot, "..", "..", "csharp") | Resolve-Path
+Write-Host "Setting Path: $csharpFolder"
+Set-Location $csharpFolder
 
-if ($loc.ToString().ToLower().EndsWith("csharp") -eq $False) {
-    cd ..\..\csharp
+Write-Host "Running dotnet pack -c Release"
+$packArgs = @{
+    "c" = "Release"
 }
-
 if ($destination) {
-    dotnet pack -c Release -o $destination
+    Write-Host " * Destination: $destination"
+    $packArgs["o"] = $destination
 }
-else {
-    dotnet pack -c Release
+if ($versionSuffix) {
+    Write-Host " * Version Suffix: $versionSuffix"
+    $packArgs["-version-suffix"] = $versionSuffix
 }
+if ($noBuild) {
+    Write-Host " * Pack without building"
+    $packArgs["-no-build"] = $true
+}
+
+dotnet pack @packArgs

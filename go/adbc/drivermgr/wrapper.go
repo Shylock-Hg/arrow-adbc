@@ -24,16 +24,26 @@ package drivermgr
 // #if !defined(ADBC_EXPORTING)
 // #define ADBC_EXPORTING
 // #endif
-// #include "adbc.h"
+// #include "arrow-adbc/adbc.h"
 // #include <stdlib.h>
+// #include <string.h>
 //
-// void releaseErr(struct AdbcError* err) { err->release(err); }
+// void releaseErr(struct AdbcError* err) {
+//     if (err->release != NULL) {
+//         err->release(err);
+//         err->release = NULL;
+//     }
+// }
 // struct ArrowArray* allocArr() {
-//     return (struct ArrowArray*)malloc(sizeof(struct ArrowArray));
+//     struct ArrowArray* array = (struct ArrowArray*)malloc(sizeof(struct ArrowArray));
+//     memset(array, 0, sizeof(struct ArrowArray));
+//     return array;
 // }
 //
 // struct ArrowArrayStream* allocArrStream() {
-//     return (struct ArrowArrayStream*)malloc(sizeof(struct ArrowArrayStream));
+//     struct ArrowArrayStream* stream = (struct ArrowArrayStream*)malloc(sizeof(struct ArrowArrayStream));
+//     memset(stream, 0, sizeof(struct ArrowArrayStream));
+//     return stream;
 // }
 //
 import "C"
@@ -43,9 +53,9 @@ import (
 	"unsafe"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/cdata"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/cdata"
 )
 
 type option struct {
@@ -79,7 +89,7 @@ func (d Driver) NewDatabase(opts map[string]string) (adbc.Database, error) {
 	}
 
 	var err C.struct_AdbcError
-	db.db = (*C.struct_AdbcDatabase)(unsafe.Pointer(C.malloc(C.sizeof_struct_AdbcDatabase)))
+	db.db = (*C.struct_AdbcDatabase)(unsafe.Pointer(C.calloc(C.sizeof_struct_AdbcDatabase, C.size_t(1))))
 	if code := adbc.Status(C.AdbcDatabaseNew(db.db, &err)); code != adbc.StatusOK {
 		return nil, toAdbcError(code, &err)
 	}
@@ -112,7 +122,13 @@ type Database struct {
 }
 
 func toAdbcError(code adbc.Status, e *C.struct_AdbcError) error {
-	err := &adbc.Error{
+	if e == nil || e.release == nil {
+		return adbc.Error{
+			Code: code,
+			Msg:  "[drivermgr] nil error",
+		}
+	}
+	err := adbc.Error{
 		Code:       code,
 		VendorCode: int32(e.vendor_code),
 		Msg:        C.GoString(e.message),

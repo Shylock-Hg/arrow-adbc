@@ -22,23 +22,27 @@
 #include <string>
 #include <vector>
 
-#include <adbc.h>
+#include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
 
-#include "common/utils.h"
 #include "copy/reader.h"
+#include "driver/common/utils.h"
 #include "postgres_type.h"
 
 #define ADBC_POSTGRESQL_OPTION_BATCH_SIZE_HINT_BYTES \
   "adbc.postgresql.batch_size_hint_bytes"
 
+#define ADBC_POSTGRESQL_OPTION_USE_COPY "adbc.postgresql.use_copy"
+
 namespace adbcpq {
 class PostgresConnection;
 class PostgresStatement;
 
+constexpr static int64_t kDefaultBatchSizeHintBytes = 16777216;
+
 /// \brief An ArrowArrayStream that reads tuples from a PGresult.
-class TupleReader final {
+class TupleReader final : public std::enable_shared_from_this<TupleReader> {
  public:
   TupleReader(PGconn* conn)
       : status_(ADBC_STATUS_OK),
@@ -48,8 +52,9 @@ class TupleReader final {
         pgbuf_(nullptr),
         copy_reader_(nullptr),
         row_id_(-1),
-        batch_size_hint_bytes_(16777216),
+        batch_size_hint_bytes_(kDefaultBatchSizeHintBytes),
         is_finished_(false) {
+    ArrowErrorInit(&na_error_);
     data_.data.as_char = nullptr;
     data_.size_bytes = 0;
   }
@@ -66,9 +71,9 @@ class TupleReader final {
  private:
   friend class PostgresStatement;
 
-  int InitQueryAndFetchFirst(struct ArrowError* error);
-  int AppendRowAndFetchNext(struct ArrowError* error);
-  int BuildOutput(struct ArrowArray* out, struct ArrowError* error);
+  int GetCopyData();
+  int AppendRowAndFetchNext();
+  int BuildOutput(struct ArrowArray* out);
 
   static int GetSchemaTrampoline(struct ArrowArrayStream* self, struct ArrowSchema* out);
   static int GetNextTrampoline(struct ArrowArrayStream* self, struct ArrowArray* out);
@@ -77,6 +82,7 @@ class TupleReader final {
 
   AdbcStatusCode status_;
   struct AdbcError error_;
+  struct ArrowError na_error_;
   PGconn* conn_;
   PGresult* result_;
   char* pgbuf_;
@@ -90,7 +96,12 @@ class TupleReader final {
 class PostgresStatement {
  public:
   PostgresStatement()
-      : connection_(nullptr), query_(), prepared_(false), reader_(nullptr) {
+      : connection_(nullptr),
+        query_(),
+        prepared_(false),
+        use_copy_(-1),
+        reader_(nullptr),
+        batch_size_hint_bytes_(kDefaultBatchSizeHintBytes) {
     std::memset(&bind_, 0, sizeof(bind_));
   }
 
@@ -125,17 +136,15 @@ class PostgresStatement {
   // Helper methods
 
   void ClearResult();
-  AdbcStatusCode CreateBulkTable(
-      const std::string& current_schema, const struct ArrowSchema& source_schema,
-      const std::vector<struct ArrowSchemaView>& source_schema_fields,
-      std::string* escaped_table, std::string* escaped_field_list,
-      struct AdbcError* error);
-  AdbcStatusCode ExecuteUpdateBulk(int64_t* rows_affected, struct AdbcError* error);
-  AdbcStatusCode ExecuteUpdateQuery(int64_t* rows_affected, struct AdbcError* error);
-  AdbcStatusCode ExecutePreparedStatement(struct ArrowArrayStream* stream,
-                                          int64_t* rows_affected,
-                                          struct AdbcError* error);
-  AdbcStatusCode SetupReader(struct AdbcError* error);
+  AdbcStatusCode CreateBulkTable(const std::string& current_schema,
+                                 const struct ArrowSchema& source_schema,
+                                 std::string* escaped_table,
+                                 std::string* escaped_field_list,
+                                 struct AdbcError* error);
+  AdbcStatusCode ExecuteIngest(struct ArrowArrayStream* stream, int64_t* rows_affected,
+                               struct AdbcError* error);
+  AdbcStatusCode ExecuteBind(struct ArrowArrayStream* stream, int64_t* rows_affected,
+                             struct AdbcError* error);
 
  private:
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
@@ -154,6 +163,9 @@ class PostgresStatement {
     kCreateAppend,
   };
 
+  // Options
+  int use_copy_;
+
   struct {
     std::string db_schema;
     std::string target;
@@ -161,6 +173,9 @@ class PostgresStatement {
     bool temporary = false;
   } ingest_;
 
-  TupleReader reader_;
+  std::shared_ptr<TupleReader> reader_;
+  int64_t batch_size_hint_bytes_;
+
+  int UseCopy();
 };
 }  // namespace adbcpq
