@@ -31,11 +31,11 @@ import (
 	"unsafe"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/decimal128"
-	"github.com/apache/arrow/go/v16/arrow/decimal256"
-	"github.com/apache/arrow/go/v16/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/decimal256"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 func getIsolationlevel(lvl sql.IsolationLevel) adbc.OptionIsolationLevel {
@@ -468,8 +468,8 @@ func arrFromVal(val any) arrow.Array {
 	case string:
 		dt = arrow.BinaryTypes.String
 		buffers[1] = memory.NewBufferBytes(arrow.Int32Traits.CastToBytes([]int32{0, int32(len(v))}))
-		var buf = *(*[]byte)(unsafe.Pointer(&v))
-		(*reflect.SliceHeader)(unsafe.Pointer(&buf)).Cap = len(v)
+
+		buf := unsafe.Slice(unsafe.StringData(v), len(v))
 		buffers = append(buffers, memory.NewBufferBytes(buf))
 	default:
 		panic(fmt.Sprintf("unsupported type %T", val))
@@ -606,7 +606,9 @@ func (r *rows) Next(dest []driver.Value) error {
 			dest[i] = nil
 			continue
 		}
-
+		if colUnion, ok := col.(array.Union); ok {
+			col = colUnion.Field(colUnion.ChildID(int(r.curRow)))
+		}
 		switch col := col.(type) {
 		case *array.Boolean:
 			dest[i] = col.Value(int(r.curRow))

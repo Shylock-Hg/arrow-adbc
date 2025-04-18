@@ -29,10 +29,10 @@ import (
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/driver/driverbase"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/flight"
-	"github.com/apache/arrow/go/v16/arrow/flight/flightsql"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/bluele/gcache"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -42,7 +42,6 @@ import (
 
 type dbDialOpts struct {
 	opts       []grpc.DialOption
-	block      bool
 	maxMsgSize int
 	authority  string
 }
@@ -51,10 +50,6 @@ func (d *dbDialOpts) rebuild() {
 	d.opts = []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(d.maxMsgSize),
 			grpc.MaxCallSendMsgSize(d.maxMsgSize)),
-		grpc.WithUserAgent("ADBC Flight SQL Driver " + infoDriverVersion),
-	}
-	if d.block {
-		d.opts = append(d.opts, grpc.WithBlock())
 	}
 	if d.authority != "" {
 		d.opts = append(d.opts, grpc.WithAuthority(d.authority))
@@ -72,6 +67,8 @@ type databaseImpl struct {
 	dialOpts      dbDialOpts
 	enableCookies bool
 	options       map[string]string
+	userDialOpts  []grpc.DialOption
+	oauthToken    credentials.PerRPCCredentials
 }
 
 func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
@@ -150,10 +147,12 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 		delete(cnOptions, OptionAuthorizationHeader)
 	}
 
+	const authConflictError = "Authentication conflict: Use either Authorization header OR username/password parameter"
+
 	if u, ok := cnOptions[adbc.OptionKeyUsername]; ok {
 		if d.hdrs.Len() > 0 {
 			return adbc.Error{
-				Msg:  "Authorization header already provided, do not provide user/pass also",
+				Msg:  authConflictError,
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
@@ -164,12 +163,39 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 	if p, ok := cnOptions[adbc.OptionKeyPassword]; ok {
 		if d.hdrs.Len() > 0 {
 			return adbc.Error{
-				Msg:  "Authorization header already provided, do not provide user/pass also",
+				Msg:  authConflictError,
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
 		d.pass = p
 		delete(cnOptions, adbc.OptionKeyPassword)
+	}
+
+	if flow, ok := cnOptions[OptionKeyOauthFlow]; ok {
+		if d.hdrs.Len() > 0 {
+			return adbc.Error{
+				Msg:  authConflictError,
+				Code: adbc.StatusInvalidArgument,
+			}
+		}
+
+		var err error
+		switch flow {
+		case ClientCredentials:
+			d.oauthToken, err = newClientCredentials(cnOptions)
+		case TokenExchange:
+			d.oauthToken, err = newTokenExchangeFlow(cnOptions)
+		default:
+			return adbc.Error{
+				Msg:  fmt.Sprintf("oauth flow not implemented: %s", flow),
+				Code: adbc.StatusNotImplemented,
+			}
+		}
+
+		if err != nil {
+			return err
+		}
+		delete(cnOptions, OptionKeyOauthFlow)
 	}
 
 	var err error
@@ -194,19 +220,15 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 		delete(cnOptions, OptionTimeoutUpdate)
 	}
 
-	if val, ok := cnOptions[OptionWithBlock]; ok {
-		if val == adbc.OptionValueEnabled {
-			d.dialOpts.block = true
-		} else if val == adbc.OptionValueDisabled {
-			d.dialOpts.block = false
-		} else {
-			return adbc.Error{
-				Msg:  fmt.Sprintf("Invalid value for database option '%s': '%s'", OptionWithBlock, val),
-				Code: adbc.StatusInvalidArgument,
-			}
+	if tv, ok := cnOptions[OptionTimeoutConnect]; ok {
+		if err = d.timeout.setTimeoutString(OptionTimeoutConnect, tv); err != nil {
+			return err
 		}
-		delete(cnOptions, OptionWithBlock)
+		delete(cnOptions, OptionTimeoutConnect)
 	}
+
+	// gRPC deprecated this and explicitly recommends against it
+	delete(cnOptions, OptionWithBlock)
 
 	if val, ok := cnOptions[OptionWithMaxMsgSize]; ok {
 		var err error
@@ -257,6 +279,8 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 		return d.timeout.queryTimeout.String(), nil
 	case OptionTimeoutUpdate:
 		return d.timeout.updateTimeout.String(), nil
+	case OptionTimeoutConnect:
+		return d.timeout.connectTimeout.String(), nil
 	}
 	if val, ok := d.options[key]; ok {
 		return val, nil
@@ -271,6 +295,8 @@ func (d *databaseImpl) GetOptionInt(key string) (int64, error) {
 	case OptionTimeoutQuery:
 		fallthrough
 	case OptionTimeoutUpdate:
+		fallthrough
+	case OptionTimeoutConnect:
 		val, err := d.GetOptionDouble(key)
 		if err != nil {
 			return 0, err
@@ -289,6 +315,8 @@ func (d *databaseImpl) GetOptionDouble(key string) (float64, error) {
 		return d.timeout.queryTimeout.Seconds(), nil
 	case OptionTimeoutUpdate:
 		return d.timeout.updateTimeout.Seconds(), nil
+	case OptionTimeoutConnect:
+		return d.timeout.connectTimeout.Seconds(), nil
 	}
 
 	return d.DatabaseImplBase.GetOptionDouble(key)
@@ -297,7 +325,7 @@ func (d *databaseImpl) GetOptionDouble(key string) (float64, error) {
 func (d *databaseImpl) SetOption(key, value string) error {
 	// We can't change most options post-init
 	switch key {
-	case OptionTimeoutFetch, OptionTimeoutQuery, OptionTimeoutUpdate:
+	case OptionTimeoutFetch, OptionTimeoutQuery, OptionTimeoutUpdate, OptionTimeoutConnect:
 		return d.timeout.setTimeoutString(key, value)
 	}
 	if strings.HasPrefix(key, OptionRPCCallHeaderPrefix) {
@@ -313,6 +341,8 @@ func (d *databaseImpl) SetOptionInt(key string, value int64) error {
 	case OptionTimeoutQuery:
 		fallthrough
 	case OptionTimeoutUpdate:
+		fallthrough
+	case OptionTimeoutConnect:
 		return d.timeout.setTimeout(key, float64(value))
 	}
 
@@ -326,6 +356,8 @@ func (d *databaseImpl) SetOptionDouble(key string, value float64) error {
 	case OptionTimeoutQuery:
 		fallthrough
 	case OptionTimeoutUpdate:
+		fallthrough
+	case OptionTimeoutConnect:
 		return d.timeout.setTimeout(key, value)
 	}
 
@@ -366,8 +398,17 @@ func getFlightClient(ctx context.Context, loc string, d *databaseImpl, authMiddl
 		creds = insecure.NewCredentials()
 		target = "unix:" + uri.Path
 	}
-	dialOpts := append(d.dialOpts.opts, grpc.WithTransportCredentials(creds))
 
+	dv, _ := d.DatabaseImplBase.DriverInfo.GetInfoForInfoCode(adbc.InfoDriverVersion)
+	driverVersion := dv.(string)
+	dialOpts := append(d.dialOpts.opts, grpc.WithConnectParams(d.timeout.connectParams()), grpc.WithTransportCredentials(creds), grpc.WithUserAgent("ADBC Flight SQL Driver "+driverVersion))
+	dialOpts = append(dialOpts, d.userDialOpts...)
+
+	if d.oauthToken != nil {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(d.oauthToken))
+	}
+
+	d.Logger.DebugContext(ctx, "new client", "location", loc)
 	cl, err := flightsql.NewClient(target, nil, middleware, dialOpts...)
 	if err != nil {
 		return nil, adbc.Error{
@@ -377,25 +418,30 @@ func getFlightClient(ctx context.Context, loc string, d *databaseImpl, authMiddl
 	}
 
 	cl.Alloc = d.Alloc
+	// Authorization header is already set, continue
 	if len(authMiddle.hdrs.Get("authorization")) > 0 {
 		d.Logger.DebugContext(ctx, "reusing auth token", "location", loc)
-	} else {
-		if d.user != "" || d.pass != "" {
-			var header, trailer metadata.MD
-			ctx, err = cl.Client.AuthenticateBasicToken(ctx, d.user, d.pass, grpc.Header(&header), grpc.Trailer(&trailer), d.timeout)
-			if err != nil {
-				return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "AuthenticateBasicToken")
-			}
+		return cl, nil
+	}
 
-			if md, ok := metadata.FromOutgoingContext(ctx); ok {
-				authMiddle.mutex.Lock()
-				defer authMiddle.mutex.Unlock()
-				authMiddle.hdrs.Set("authorization", md.Get("Authorization")[0])
-			}
+	var authValue string
+
+	if d.user != "" || d.pass != "" {
+		var header, trailer metadata.MD
+		ctx, err = cl.Client.AuthenticateBasicToken(ctx, d.user, d.pass, grpc.Header(&header), grpc.Trailer(&trailer), d.timeout)
+		if err != nil {
+			return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "AuthenticateBasicToken")
+		}
+
+		if md, ok := metadata.FromOutgoingContext(ctx); ok {
+			authValue = md.Get("Authorization")[0]
 		}
 	}
 
-	d.Logger.DebugContext(ctx, "new client", "location", loc)
+	if authValue != "" {
+		authMiddle.SetHeader(authValue)
+	}
+
 	return cl, nil
 }
 
@@ -486,9 +532,17 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		}
 	}
 
-	return &cnxn{cl: cl, db: d, clientCache: cache,
-		hdrs: make(metadata.MD), timeouts: d.timeout,
-		supportInfo: cnxnSupport}, nil
+	conn := &connectionImpl{
+		cl: cl, db: d, clientCache: cache,
+		hdrs: make(metadata.MD), timeouts: d.timeout, supportInfo: cnxnSupport,
+		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
+	}
+
+	return driverbase.NewConnectionBuilder(conn).
+		WithDriverInfoPreparer(conn).
+		WithAutocommitSetter(conn).
+		WithCurrentNamespacer(conn).
+		Connection(), nil
 }
 
 type bearerAuthMiddleware struct {
@@ -511,4 +565,10 @@ func (b *bearerAuthMiddleware) HeadersReceived(ctx context.Context, md metadata.
 		defer b.mutex.Unlock()
 		b.hdrs.Set("authorization", headers...)
 	}
+}
+
+func (b *bearerAuthMiddleware) SetHeader(authValue string) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.hdrs.Set("authorization", authValue)
 }

@@ -31,8 +31,8 @@ https://github.com/apache/arrow-adbc/issues
 Some dependencies are required to build and test the various ADBC packages.
 
 For C/C++, you will most likely want a [Conda][conda] installation,
-with [Mambaforge][mambaforge] being the most convenient distribution.
-If you have Mambaforge installed, you can set up a development
+with [Miniforge][miniforge] being the most convenient distribution.
+If you have Miniforge installed, you can set up a development
 environment as follows:
 
 ```shell
@@ -52,7 +52,28 @@ CMake or other build tool appropriately.  However, we primarily
 develop and support Conda users.
 
 [conda]: https://docs.conda.io/en/latest/
-[mambaforge]: https://mamba.readthedocs.io/en/latest/installation.html
+[miniforge]: https://mamba.readthedocs.io/en/latest/installation/mamba-installation.html
+
+### Running Integration Tests
+
+Many of the test suites need to run against external services.  For example,
+the PostgreSQL driver needs to test against a running database!  This can be
+done by setting environment variables to tell tests where the services they
+need can be located.
+
+To standardize the configuration of these services, we use a Docker Compose
+file and a dotenv file.  Services can be started with Docker Compose:
+
+```shell
+$ docker compose up --detach --wait postgres-test
+```
+
+Then, source the .env file at the root of the repo to set the environment
+variables before running tests:
+
+```shell
+$ source .env
+```
 
 ### C/C++
 
@@ -126,6 +147,52 @@ for details.
 [cmake-compile-commands]: https://cmake.org/cmake/help/latest/variable/CMAKE_EXPORT_COMPILE_COMMANDS.html
 [cmake-prefix-path]: https://cmake.org/cmake/help/latest/variable/CMAKE_PREFIX_PATH.html
 [gtest]: https://github.com/google/googletest/
+
+### C/C++ with Meson
+
+While CMake is the officially supported build generator, there is limited,
+experimental support for the Meson build system. Meson offers arguably better
+dependency management than CMake, with a syntax that Python developers may
+find more readable.
+
+To use Meson, start at the c directory and run:
+
+```shell
+$ meson setup build
+```
+
+For a full list of options, ``meson configure`` will bring up a pager
+with sections that you can navigate. The "Project Options" section in particular
+will show you what ADBC has to offer, and each option can be provided using
+the form ``-D_option_:_value_``. For example, to build the a debug version of
+the SQLite3 driver along with tests, you would run:
+
+```shell
+$ meson configure -Dbuildtype=debug -Dsqlite=true -Dtests=true build
+```
+
+With the options set, you can then compile the project. For most dependencies,
+Meson will try to find them on your system and fall back to downloading a copy
+from its WrapDB for you:
+
+```shell
+$ meson compile -C build
+```
+
+To run the test suite, simply run:
+
+```shell
+$ meson test -C build
+```
+
+### C#/.NET
+
+Make sure [.NET Core is installed](https://dotnet.microsoft.com/en-us/download).
+
+```shell
+$ cd csharp
+$ dotnet build
+```
 
 ### Documentation
 
@@ -220,6 +287,72 @@ $ cd java/
 $ mvn clean install
 ```
 
+CI also builds the project with [Checker Framework][checker-framework] and
+[ErrorProne][error-prone] enabled.  These projects require additional
+configuration.  First, create a file `java/.mvn/jvm.config` containing this:
+
+```
+--add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED
+--add-exports jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED
+--add-opens jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED
+--add-opens jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED
+```
+
+This is required so that the above static analysis tools can continue to
+access necessary Java compiler internals to do their job.
+
+Then, build with the `errorprone` Maven profile enabled:
+
+```
+mvn install -Perrorprone
+```
+
+[checker-framework]: https://checkerframework.org/
+[errorprone]: https://errorprone.info/
+
+#### JNI
+
+To build the JNI bridge, the native components must be built.
+
+```
+# Build the driver manager
+export ADBC_BUILD_STATIC=ON
+export ADBC_BUILD_TESTS=OFF
+export ADBC_USE_ASAN=OFF
+export ADBC_USE_UBSAN=OFF
+export BUILD_ALL=OFF
+export BUILD_DRIVER_MANAGER=ON
+export BUILD_DRIVER_SQLITE=ON
+./ci/scripts/cpp_build.sh $(pwd) $(pwd)/build $(pwd)/local
+
+# Build the JNI libraries
+./ci/scripts/java_jni_build.sh $(pwd) $(pwd)/java/build $(pwd)/local
+```
+
+Now build the Java code with the `jni` Maven profile enabled.  To run tests,
+the SQLite driver must also be present in (DY)LD_LIBRARY_PATH.
+
+```
+export LD_LIBRARY_PATH=$(pwd)/local/lib
+pushd java
+mvn install -Pjni
+popd
+```
+
+This will build a JAR with native libraries for a single platform.  If the
+native libraries are built for multiple platforms, they can all be copied to
+appropriate paths in the resources directory to build a single JAR that works
+across multiple platforms.
+
+You can also build and test in IntelliJ; simply edit the run/test
+configuration to add `LD_LIBRARY_PATH` to the environment.
+
 ### Python
 
 Python libraries are managed with [setuptools][setuptools].  See
@@ -278,6 +411,7 @@ Before opening a pull request:
 
 1. Please check if there is a corresponding issue (_and if not, please make one_).
 2. Assign the issue to yourself by commenting "take" in the issue.
+   (_Here's an [example](https://github.com/apache/arrow-adbc/issues/1505#issuecomment-1920134722)._)
 3. At the bottom of the PR description, add `Closes #NNNN` where `NNNN` is the
    issue number, so that the issue gets linked to your PR properly. ("Fixes"
    and other keywords that GitHub recognizes are also OK, of course.)
@@ -355,7 +489,9 @@ $ cd go/adbc && go-licenses report ./... \
   --ignore github.com/apache/arrow/go/v11 \
   --ignore github.com/apache/arrow/go/v12 \
   --ignore github.com/apache/arrow/go/v13 \
+  --ignore github.com/apache/arrow/go/v14 \
   --ignore github.com/apache/arrow/go/v15 \
+  --ignore github.com/apache/arrow/go/v16 \
   --template ../../license.tpl > ../../LICENSE.txt 2> /dev/null
 ```
 

@@ -35,6 +35,13 @@ overall approach.
           Performance/optimization and support for complex types and
           different ADBC features is still ongoing.
 
+.. note:: AWS Redshift supports a very old version of the PostgreSQL
+          wire protocol and has a basic level of support in the ADBC
+          PostgreSQL driver. Because Redshift does not support reading or
+          writing COPY in PostgreSQL binary format, the optimizations that
+          accellerate non-Redshift queries are not enabled when connecting
+          to a Redshift database. This functionality is experimental.
+
 Installation
 ============
 
@@ -81,7 +88,7 @@ Usage
 =====
 
 To connect to a database, supply the "uri" parameter when constructing
-the :cpp:class:`AdbcDatabase`.  This should be a `connection URI
+the :c:struct:`AdbcDatabase`.  This should be a `connection URI
 <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING>`_.
 
 .. tab-set::
@@ -91,7 +98,7 @@ the :cpp:class:`AdbcDatabase`.  This should be a `connection URI
 
       .. code-block:: cpp
 
-         #include "adbc.h"
+         #include "arrow-adbc/adbc.h"
 
          // Ignoring error handling
          struct AdbcDatabase database;
@@ -164,6 +171,15 @@ Supported Features
 The PostgreSQL driver mostly supports features defined in the ADBC API
 specification 1.0.0, but not all cases are fully implemented
 (particularly around bind parameters and prepared statements).
+
+Bind Parameters and Prepared Statements
+---------------------------------------
+
+The PostgreSQL driver only supports executing prepared statements with
+parameters that do not return result sets (basically, an INSERT with
+parameters).  Queries that return result sets are difficult with prepared
+statements because the driver is built around using COPY for best
+performance, which is not supported in this context.
 
 Bulk Ingestion
 --------------
@@ -319,3 +335,29 @@ being read or written.
                 adjusted to the PostgreSQL epoch (2000-01-01) and so may
                 overflow/underflow; an error will be returned if this would be
                 the case.
+
+Unknown Types
+~~~~~~~~~~~~~
+
+Types without direct Arrow equivalents can still be returned by the driver.
+In this case, the Arrow type will be binary, and the contents will be the raw
+bytes as provided by the PostgreSQL wire protocol.
+
+For Arrow implementations that support the :external:doc:`Opaque canonical
+extension type <format/CanonicalExtensions>`, the extension type metadata is
+also always present.  This helps differentiate when the driver intentionally
+returned a binary column from when it returned a binary column as a fallback.
+
+.. warning:: Currently, the driver also attaches a metadata key named
+             ``ADBC:posgresql:typname`` to the schema field of the unknown
+             column, but this has been deprecated in favor of the Opaque type
+             and you should not rely on this key continuing to exist.
+
+Software Versions
+=================
+
+For Python wheels, the shipped version of the PostgreSQL client libraries is
+15.2.  For conda-forge packages, the version of libpq is the same as the
+version of libpq in your Conda environment.
+
+The PostgreSQL driver is tested against PostgreSQL versions 11 through 16.

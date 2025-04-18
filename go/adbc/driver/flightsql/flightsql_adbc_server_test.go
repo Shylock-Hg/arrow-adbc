@@ -20,9 +20,21 @@
 package flightsql_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/textproto"
 	"os"
 	"strconv"
@@ -35,18 +47,22 @@ import (
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	driver "github.com/apache/arrow-adbc/go/adbc/driver/flightsql"
-	"github.com/apache/arrow/go/v16/arrow"
-	"github.com/apache/arrow/go/v16/arrow/array"
-	"github.com/apache/arrow/go/v16/arrow/flight"
-	"github.com/apache/arrow/go/v16/arrow/flight/flightsql"
-	"github.com/apache/arrow/go/v16/arrow/flight/flightsql/schema_ref"
-	"github.com/apache/arrow/go/v16/arrow/memory"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
+	flightproto "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/exp/maps"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -63,24 +79,32 @@ type ServerBasedTests struct {
 	cnxn adbc.Connection
 }
 
-func (suite *ServerBasedTests) DoSetupSuite(srv flightsql.Server, srvMiddleware []flight.ServerMiddleware, dbArgs map[string]string) {
-	suite.s = flight.NewServerWithMiddleware(srvMiddleware)
+func (suite *ServerBasedTests) DoSetupSuite(srv flightsql.Server, srvMiddleware []flight.ServerMiddleware, dbArgs map[string]string, dialOpts ...grpc.DialOption) {
+	suite.setupFlightServer(srv, srvMiddleware)
+
+	suite.setupDatabase(dbArgs, dialOpts...)
+}
+
+func (suite *ServerBasedTests) setupDatabase(dbArgs map[string]string, dialOpts ...grpc.DialOption) {
+	var err error
+	uri := "grpc+tcp://" + suite.s.Addr().String()
+
+	args := map[string]string{
+		"uri": uri,
+	}
+	maps.Copy(args, dbArgs)
+	suite.db, err = (driver.NewDriver(memory.DefaultAllocator)).NewDatabaseWithOptions(args, dialOpts...)
+	suite.Require().NoError(err)
+}
+
+func (suite *ServerBasedTests) setupFlightServer(srv flightsql.Server, srvMiddleware []flight.ServerMiddleware, srvOpts ...grpc.ServerOption) {
+	suite.s = flight.NewServerWithMiddleware(srvMiddleware, srvOpts...)
 	suite.s.RegisterFlightService(flightsql.NewFlightServer(srv))
 	suite.Require().NoError(suite.s.Init("localhost:0"))
 	suite.s.SetShutdownOnSignals(os.Interrupt, os.Kill)
 	go func() {
 		_ = suite.s.Serve()
 	}()
-
-	uri := "grpc+tcp://" + suite.s.Addr().String()
-	var err error
-
-	args := map[string]string{
-		"uri": uri,
-	}
-	maps.Copy(args, dbArgs)
-	suite.db, err = (driver.NewDriver(memory.DefaultAllocator)).NewDatabase(args)
-	suite.Require().NoError(err)
 }
 
 func (suite *ServerBasedTests) SetupTest() {
@@ -99,10 +123,67 @@ func (suite *ServerBasedTests) TearDownSuite() {
 	suite.s.Shutdown()
 }
 
+func (suite *ServerBasedTests) generateCertOption() grpc.ServerOption {
+	// Generate a self-signed certificate in-process for testing
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	suite.Require().NoError(err)
+	certTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Unit Tests Incorporated"},
+		},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	certDer, err := x509.CreateCertificate(rand.Reader, &certTemplate, &certTemplate, &privKey.PublicKey, privKey)
+	suite.Require().NoError(err)
+	buffer := &bytes.Buffer{}
+	suite.Require().NoError(pem.Encode(buffer, &pem.Block{Type: "CERTIFICATE", Bytes: certDer}))
+	certBytes := make([]byte, buffer.Len())
+	copy(certBytes, buffer.Bytes())
+	buffer.Reset()
+	suite.Require().NoError(pem.Encode(buffer, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privKey)}))
+	keyBytes := make([]byte, buffer.Len())
+	copy(keyBytes, buffer.Bytes())
+
+	cert, err := tls.X509KeyPair(certBytes, keyBytes)
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(err)
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	tlsCreds := credentials.NewTLS(tlsConfig)
+
+	return grpc.Creds(tlsCreds)
+}
+
+func (suite *ServerBasedTests) openAndExecuteQuery(query string) {
+	var err error
+	suite.cnxn, err = suite.db.Open(context.Background())
+	suite.Require().NoError(err)
+	defer suite.cnxn.Close()
+
+	stmt, err := suite.cnxn.NewStatement()
+	suite.Require().NoError(err)
+	defer stmt.Close()
+
+	suite.Require().NoError(stmt.SetSqlQuery(query))
+	reader, _, err := stmt.ExecuteQuery(context.Background())
+	suite.NoError(err)
+	defer reader.Release()
+}
+
 // ---- Tests --------------------
 
 func TestAuthn(t *testing.T) {
 	suite.Run(t, &AuthnTests{})
+}
+
+func TestGrpcDialerOptions(t *testing.T) {
+	suite.Run(t, &DialerOptionsTests{})
 }
 
 func TestErrorDetails(t *testing.T) {
@@ -131,6 +212,18 @@ func TestDataType(t *testing.T) {
 
 func TestMultiTable(t *testing.T) {
 	suite.Run(t, &MultiTableTests{})
+}
+
+func TestSessionOptions(t *testing.T) {
+	suite.Run(t, &SessionOptionTests{})
+}
+
+func TestGetObjects(t *testing.T) {
+	suite.Run(t, &GetObjectsTests{})
+}
+
+func TestOauth(t *testing.T) {
+	suite.Run(t, &OAuthTests{})
 }
 
 // ---- AuthN Tests --------------------
@@ -213,15 +306,326 @@ type AuthnTests struct {
 }
 
 func (suite *AuthnTests) SetupSuite() {
-	suite.DoSetupSuite(&AuthnTestServer{}, []flight.ServerMiddleware{
+	suite.setupFlightServer(&AuthnTestServer{}, []flight.ServerMiddleware{
 		{Stream: authnTestStream, Unary: authnTestUnary},
-	}, map[string]string{
-		driver.OptionAuthorizationHeader: "Bearer initial",
 	})
 }
 
+func (suite *AuthnTests) SetupTest() {
+	suite.setupDatabase(map[string]string{
+		"uri": "grpc+tcp://" + suite.s.Addr().String(),
+	})
+}
+
+func (suite *AuthnTests) TearDownTest() {
+	suite.NoError(suite.db.Close())
+	suite.db = nil
+}
+
+func (suite *AuthnTests) TearDownSuite() {
+	suite.s.Shutdown()
+}
+
 func (suite *AuthnTests) TestBearerTokenUpdated() {
+	err := suite.db.SetOptions(map[string]string{
+		driver.OptionAuthorizationHeader: "Bearer initial",
+	})
+	suite.Require().NoError(err)
+
 	// apache/arrow-adbc#584: when setting the auth header directly, the client should use any updated token value from the server if given
+
+	suite.openAndExecuteQuery("a-query")
+}
+
+type OAuthTests struct {
+	ServerBasedTests
+
+	oauthServer     *httptest.Server
+	mockOAuthServer *MockOAuthServer
+}
+
+// MockOAuthServer simulates an OAuth 2.0 server for testing
+type MockOAuthServer struct {
+	// Track calls to validate server behavior
+	clientCredentialsCalls int
+	tokenExchangeCalls     int
+}
+
+func (m *MockOAuthServer) handleTokenRequest(w http.ResponseWriter, r *http.Request) {
+	// Parse the form to get the request parameters
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	grantType := r.FormValue("grant_type")
+
+	switch grantType {
+	case "client_credentials":
+		m.clientCredentialsCalls++
+		// Validate client credentials
+		clientID := r.FormValue("client_id")
+		clientSecret := r.FormValue("client_secret")
+
+		if clientID == "test-client" && clientSecret == "test-secret" {
+			// Return a valid token response
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"access_token": "test-client-token",
+				"token_type": "bearer",
+				"expires_in": 3600
+			}`))
+
+			return
+		}
+
+	case "urn:ietf:params:oauth:grant-type:token-exchange":
+		m.tokenExchangeCalls++
+		// Validate token exchange parameters
+		subjectToken := r.FormValue("subject_token")
+		subjectTokenType := r.FormValue("subject_token_type")
+
+		if subjectToken == "test-subject-token" &&
+			subjectTokenType == "urn:ietf:params:oauth:token-type:jwt" {
+			// Return a valid token response
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"access_token": "test-exchanged-token",
+				"token_type": "bearer",
+				"expires_in": 3600
+			}`))
+			return
+		}
+	}
+
+	// Default: return error for invalid request
+	http.Error(w, "Invalid request", http.StatusBadRequest)
+}
+
+func oauthTestUnary(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.InvalidArgument, "Could not get metadata")
+	}
+	auth := md.Get("authorization")
+	if len(auth) == 0 {
+		return nil, status.Error(codes.Unauthenticated, "No token")
+	} else if auth[0] != "Bearer test-exchanged-token" && auth[0] != "Bearer test-client-token" {
+		return nil, status.Error(codes.Unauthenticated, "Invalid token for unary call: "+auth[0])
+	}
+
+	md.Set("authorization", "Bearer final")
+	ctx = metadata.NewOutgoingContext(ctx, md)
+	return handler(ctx, req)
+}
+
+func (suite *OAuthTests) SetupSuite() {
+	suite.mockOAuthServer = &MockOAuthServer{}
+	suite.oauthServer = httptest.NewServer(http.HandlerFunc(suite.mockOAuthServer.handleTokenRequest))
+
+	suite.setupFlightServer(&AuthnTestServer{}, []flight.ServerMiddleware{
+		{Unary: oauthTestUnary},
+	}, suite.generateCertOption())
+}
+
+func (suite *OAuthTests) TearDownSuite() {
+	suite.oauthServer.Close()
+	suite.s.Shutdown()
+}
+
+func (suite *OAuthTests) SetupTest() {
+	suite.setupDatabase(map[string]string{
+		"uri": "grpc+tls://" + suite.s.Addr().String(),
+	})
+}
+
+func (suite *OAuthTests) TearDownTest() {
+	suite.NoError(suite.db.Close())
+	suite.db = nil
+}
+
+func (suite *OAuthTests) TestTokenExchangeFlow() {
+	err := suite.db.SetOptions(map[string]string{
+		driver.OptionKeyOauthFlow:        driver.TokenExchange,
+		driver.OptionKeySubjectToken:     "test-subject-token",
+		driver.OptionKeySubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+		driver.OptionKeyTokenURI:         suite.oauthServer.URL,
+		driver.OptionSSLSkipVerify:       adbc.OptionValueEnabled,
+	})
+	suite.Require().NoError(err)
+
+	suite.openAndExecuteQuery("a-query")
+	suite.Equal(1, suite.mockOAuthServer.tokenExchangeCalls, "Token exchange flow should be called once")
+}
+
+func (suite *OAuthTests) TestClientCredentialsFlow() {
+	err := suite.db.SetOptions(map[string]string{
+		driver.OptionKeyOauthFlow:    driver.ClientCredentials,
+		driver.OptionKeyClientId:     "test-client",
+		driver.OptionKeyClientSecret: "test-secret",
+		driver.OptionKeyTokenURI:     suite.oauthServer.URL,
+		driver.OptionSSLSkipVerify:   adbc.OptionValueEnabled,
+	})
+	suite.Require().NoError(err)
+
+	suite.cnxn, err = suite.db.Open(context.Background())
+	suite.Require().NoError(err)
+	defer suite.cnxn.Close()
+
+	suite.openAndExecuteQuery("a-query")
+	// golang/oauth2 tries to call the token endpoint sending the client credentials in the authentication header,
+	// if it fails, it retries sending the client credentials in the request body.
+	// See https://code.google.com/p/goauth2/issues/detail?id=31 for background.
+	suite.Equal(2, suite.mockOAuthServer.clientCredentialsCalls, "Client credentials flow should be called once")
+}
+
+func (suite *OAuthTests) TestFailOauthWithTokenSet() {
+	err := suite.db.SetOptions(map[string]string{
+		driver.OptionAuthorizationHeader: "Bearer test-client-token",
+		driver.OptionKeyOauthFlow:        driver.ClientCredentials,
+		driver.OptionKeyClientId:         "test-client",
+		driver.OptionKeyClientSecret:     "test-secret",
+		driver.OptionKeyTokenURI:         suite.oauthServer.URL,
+	})
+	suite.Error(err, "Expected error for missing parameters")
+	suite.Contains(err.Error(), "Authentication conflict: Use either Authorization header OR username/password parameter")
+}
+
+func (suite *OAuthTests) TestMissingRequiredParamsTokenExchange() {
+	testCases := []struct {
+		name             string
+		options          map[string]string
+		expectedErrorMsg string
+	}{
+		{
+			name: "Missing token",
+			options: map[string]string{
+				driver.OptionKeyOauthFlow:        driver.TokenExchange,
+				driver.OptionKeySubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+				driver.OptionKeyTokenURI:         suite.oauthServer.URL,
+			},
+			expectedErrorMsg: "token exchange grant requires adbc.flight.sql.oauth.exchange.subject_token",
+		},
+		{
+			name: "Missing subject token type",
+			options: map[string]string{
+				driver.OptionKeyOauthFlow:    driver.TokenExchange,
+				driver.OptionKeySubjectToken: "test-subject-token",
+				driver.OptionKeyTokenURI:     suite.oauthServer.URL,
+			},
+			expectedErrorMsg: "token exchange grant requires adbc.flight.sql.oauth.exchange.subject_token_type",
+		},
+		{
+			name: "Missing token URI",
+			options: map[string]string{
+				driver.OptionKeyOauthFlow:        driver.TokenExchange,
+				driver.OptionKeySubjectToken:     "test-subject-token",
+				driver.OptionKeySubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+			},
+			expectedErrorMsg: "token exchange grant requires adbc.flight.sql.oauth.token_uri",
+		},
+	}
+
+	for _, tc := range testCases {
+		suite.Run(tc.name, func() {
+			// We need to set options with the driver's SetOptions method
+			err := suite.db.SetOptions(tc.options)
+			suite.Error(err, "Expected error for missing parameters")
+			suite.Contains(err.Error(), tc.expectedErrorMsg)
+		})
+	}
+}
+func (suite *OAuthTests) TestMissingRequiredParamsClientCredentials() {
+	testCases := []struct {
+		name             string
+		options          map[string]string
+		expectedErrorMsg string
+	}{
+		{
+			name: "Missing client ID",
+			options: map[string]string{
+				driver.OptionKeyOauthFlow:    driver.ClientCredentials,
+				driver.OptionKeyClientSecret: "test-secret",
+				driver.OptionKeyTokenURI:     suite.oauthServer.URL,
+			},
+			expectedErrorMsg: "client credentials grant requires adbc.flight.sql.oauth.client_id",
+		},
+		{
+			name: "Missing client secret",
+			options: map[string]string{
+				driver.OptionKeyOauthFlow: driver.ClientCredentials,
+				driver.OptionKeyClientId:  "test-client",
+				driver.OptionKeyTokenURI:  suite.oauthServer.URL,
+			},
+			expectedErrorMsg: "client credentials grant requires adbc.flight.sql.oauth.client_secret",
+		},
+		{
+			name: "Missing token URI",
+			options: map[string]string{
+				driver.OptionKeyOauthFlow:    driver.ClientCredentials,
+				driver.OptionKeyClientId:     "test-client",
+				driver.OptionKeyClientSecret: "test-secret",
+			},
+			expectedErrorMsg: "client credentials grant requires adbc.flight.sql.oauth.token_uri",
+		},
+	}
+
+	for _, tc := range testCases {
+		suite.Run(tc.name, func() {
+			// We need to set options with the driver's SetOptions method
+			err := suite.db.SetOptions(tc.options)
+			suite.Error(err, "Expected error for missing parameters")
+			suite.Contains(err.Error(), tc.expectedErrorMsg)
+		})
+	}
+}
+
+func (suite *OAuthTests) TestInvalidOAuthFlow() {
+	err := suite.db.SetOptions(map[string]string{
+		driver.OptionKeyOauthFlow:    "invalid-flow",
+		driver.OptionKeySubjectToken: "test-token",
+	})
+
+	suite.Error(err, "Expected error for invalid OAuth flow")
+	suite.Contains(err.Error(), "Not Implemented: oauth flow not implemented: invalid-flow")
+}
+
+// ---- Grpc Dialer Options Tests --------------
+
+type DialerOptionsTests struct {
+	ServerBasedTests
+	statsHandler *dialerOptionsGrpcStatsHandler
+}
+
+type dialerOptionsGrpcStatsHandler struct {
+	connectionsHandled int
+	rpcsHandled        int
+	connectionsTagged  int
+	rpcsTagged         int
+}
+
+func (d *dialerOptionsGrpcStatsHandler) HandleConn(ctx context.Context, stat stats.ConnStats) {
+	d.connectionsHandled++
+}
+func (d *dialerOptionsGrpcStatsHandler) HandleRPC(ctx context.Context, stat stats.RPCStats) {
+	d.rpcsHandled++
+}
+func (d *dialerOptionsGrpcStatsHandler) TagConn(ctx context.Context, stat *stats.ConnTagInfo) context.Context {
+	d.connectionsTagged++
+	return ctx
+}
+func (d *dialerOptionsGrpcStatsHandler) TagRPC(ctx context.Context, stat *stats.RPCTagInfo) context.Context {
+	d.rpcsTagged++
+	return ctx
+}
+
+func (suite *DialerOptionsTests) SetupSuite() {
+	suite.statsHandler = &dialerOptionsGrpcStatsHandler{}
+	suite.DoSetupSuite(&AuthnTestServer{}, nil, nil, grpc.WithStatsHandler(suite.statsHandler))
+}
+
+// TestGrpcObserved validates that the grpc stats handler that was passed through correctly to the underlying grpc client.
+func (suite *DialerOptionsTests) TestGrpcObserved() {
 	stmt, err := suite.cnxn.NewStatement()
 	suite.Require().NoError(err)
 	defer stmt.Close()
@@ -230,6 +634,11 @@ func (suite *AuthnTests) TestBearerTokenUpdated() {
 	reader, _, err := stmt.ExecuteQuery(context.Background())
 	suite.NoError(err)
 	defer reader.Release()
+
+	suite.Less(0, suite.statsHandler.connectionsTagged)
+	suite.Less(0, suite.statsHandler.connectionsHandled)
+	suite.Less(0, suite.statsHandler.rpcsTagged)
+	suite.Less(0, suite.statsHandler.rpcsHandled)
 }
 
 // ---- Error Details Tests --------------------
@@ -252,6 +661,16 @@ func (srv *ErrorDetailsTestServer) GetFlightInfoStatement(ctx context.Context, q
 			panic(err)
 		}
 		return &flight.FlightInfo{Endpoint: []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: tkt}}}}, nil
+	} else if query.GetQuery() == "vendorcode" {
+		return nil, status.Errorf(codes.ResourceExhausted, "Resource exhausted")
+	} else if query.GetQuery() == "binaryheader" {
+		if err := grpc.SendHeader(ctx, metadata.Pairs("x-header-bin", string([]byte{0, 110}))); err != nil {
+			return nil, err
+		}
+		if err := grpc.SetTrailer(ctx, metadata.Pairs("x-trailer-bin", string([]byte{111, 0, 112}))); err != nil {
+			return nil, err
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "Resource exhausted")
 	}
 	return nil, status.Errorf(codes.Unimplemented, "GetSchemaStatement not implemented")
 }
@@ -286,6 +705,43 @@ func (suite *ErrorDetailsTests) SetupSuite() {
 	suite.DoSetupSuite(&srv, nil, nil)
 }
 
+func (ts *ErrorDetailsTests) TestBinaryDetails() {
+	stmt, err := ts.cnxn.NewStatement()
+	ts.NoError(err)
+	defer stmt.Close()
+
+	ts.NoError(stmt.SetSqlQuery("binaryheader"))
+
+	_, _, err = stmt.ExecuteQuery(context.Background())
+	var adbcErr adbc.Error
+	ts.ErrorAs(err, &adbcErr)
+
+	ts.Equal(int32(codes.FailedPrecondition), adbcErr.VendorCode)
+
+	ts.Equal(2, len(adbcErr.Details))
+
+	headerFound := false
+	trailerFound := false
+	for _, wrapper := range adbcErr.Details {
+		switch wrapper.Key() {
+		case "x-header-bin":
+			val, err := wrapper.Serialize()
+			ts.NoError(err)
+			ts.Equal([]byte{0, 110}, val)
+			headerFound = true
+		case "x-trailer-bin":
+			val, err := wrapper.Serialize()
+			ts.NoError(err)
+			ts.Equal([]byte{111, 0, 112}, val)
+			trailerFound = true
+		default:
+			ts.Failf("Unexpected detail key: %s", wrapper.Key())
+		}
+	}
+	ts.Truef(headerFound, "Did not find x-header-bin")
+	ts.Truef(trailerFound, "Did not find x-trailer-bin")
+}
+
 func (ts *ErrorDetailsTests) TestGetFlightInfo() {
 	stmt, err := ts.cnxn.NewStatement()
 	ts.NoError(err)
@@ -296,6 +752,8 @@ func (ts *ErrorDetailsTests) TestGetFlightInfo() {
 	_, _, err = stmt.ExecuteQuery(context.Background())
 	var adbcErr adbc.Error
 	ts.ErrorAs(err, &adbcErr)
+
+	ts.Equal(int32(codes.Unknown), adbcErr.VendorCode)
 
 	ts.Equal(1, len(adbcErr.Details))
 
@@ -344,6 +802,20 @@ func (ts *ErrorDetailsTests) TestDoGet() {
 	message := wrappers.Int32Value{}
 	ts.NoError(any.UnmarshalTo(&message))
 	ts.Equal(int32(42), message.Value)
+}
+
+func (ts *ErrorDetailsTests) TestVendorCode() {
+	stmt, err := ts.cnxn.NewStatement()
+	ts.NoError(err)
+	defer stmt.Close()
+
+	ts.NoError(stmt.SetSqlQuery("vendorcode"))
+
+	_, _, err = stmt.ExecuteQuery(context.Background())
+	var adbcErr adbc.Error
+	ts.ErrorAs(err, &adbcErr)
+
+	ts.Equal(int32(codes.ResourceExhausted), adbcErr.VendorCode)
 }
 
 // ---- ExecuteSchema Tests --------------------
@@ -441,6 +913,9 @@ func (ts *ExecuteSchemaTests) TestQuery() {
 type IncrementalQuery struct {
 	query     string
 	nextIndex int
+	// if set, then return an error in the next poll and unset
+	// for testing the client's error handling
+	unavailable bool
 }
 
 type IncrementalPollTestServer struct {
@@ -448,6 +923,10 @@ type IncrementalPollTestServer struct {
 	mu        sync.Mutex
 	queries   map[string]*IncrementalQuery
 	testCases map[string]IncrementalPollTestCase
+}
+
+var unavailableCase = IncrementalPollTestCase{
+	progress: []int{1, 1},
 }
 
 func (srv *IncrementalPollTestServer) PollFlightInfo(ctx context.Context, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
@@ -475,28 +954,99 @@ func (srv *IncrementalPollTestServer) PollFlightInfo(ctx context.Context, desc *
 		return nil, status.Errorf(codes.NotFound, "Query ID not found")
 	}
 
+	if query.query == "infinite" {
+		query.nextIndex++
+
+		descriptor, err := proto.Marshal(&wrapperspb.StringValue{Value: queryId})
+		if err != nil {
+			return nil, err
+		}
+		return &flight.PollInfo{
+			Info: &flight.FlightInfo{
+				Schema: nil,
+				Endpoint: []*flight.FlightEndpoint{{
+					Ticket: &flight.Ticket{
+						Ticket: []byte{},
+					},
+				}},
+				AppMetadata: []byte("app metadata"),
+			},
+			FlightDescriptor: &flight.FlightDescriptor{
+				Type: flight.DescriptorCMD,
+				Cmd:  descriptor,
+			},
+			// always makes a bit of progress, never gets anywhere
+			Progress: proto.Float64(float64(query.nextIndex) / 100.0),
+		}, nil
+	}
+
 	testCase, ok := srv.testCases[query.query]
 	if !ok {
-		return nil, status.Errorf(codes.Unimplemented, fmt.Sprintf("Invalid case %s", query.query))
+		if query.query == "unavailable" {
+			testCase = unavailableCase
+		} else {
+			return nil, status.Errorf(codes.Unimplemented, "Invalid case %s", query.query)
+		}
 	}
 
 	if testCase.differentRetryDescriptor && progress != int64(query.nextIndex) {
-		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("Used wrong retry descriptor, expected %d but got %d", query.nextIndex, progress))
+		return nil, status.Errorf(codes.InvalidArgument, "Used wrong retry descriptor, expected %d but got %d", query.nextIndex, progress)
+	}
+
+	if query.unavailable {
+		query.unavailable = false
+		return nil, status.Errorf(codes.Unavailable, "Server temporarily unavailable")
 	}
 
 	return srv.MakePollInfo(&testCase, query, queryId)
 }
 
 func (srv *IncrementalPollTestServer) PollFlightInfoStatement(ctx context.Context, query flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
 	queryId := uuid.New().String()
+
+	if query.GetQuery() == "unavailable" {
+		srv.queries[queryId] = &IncrementalQuery{
+			query:       query.GetQuery(),
+			nextIndex:   0,
+			unavailable: true,
+		}
+
+		return srv.MakePollInfo(&unavailableCase, srv.queries[queryId], queryId)
+	} else if query.GetQuery() == "infinite" {
+		srv.queries[queryId] = &IncrementalQuery{
+			query:     query.GetQuery(),
+			nextIndex: 0,
+		}
+
+		descriptor, err := proto.Marshal(&wrapperspb.StringValue{Value: queryId})
+		if err != nil {
+			return nil, err
+		}
+		return &flight.PollInfo{
+			Info: &flight.FlightInfo{
+				Schema: nil,
+				Endpoint: []*flight.FlightEndpoint{{
+					Ticket: &flight.Ticket{
+						Ticket: []byte{},
+					},
+				}},
+				AppMetadata: []byte("app metadata"),
+			},
+			FlightDescriptor: &flight.FlightDescriptor{
+				Type: flight.DescriptorCMD,
+				Cmd:  descriptor,
+			},
+			Progress: proto.Float64(0),
+		}, nil
+	}
 
 	testCase, ok := srv.testCases[query.GetQuery()]
 	if !ok {
-		return nil, status.Errorf(codes.Unimplemented, fmt.Sprintf("Invalid case %s", query.GetQuery()))
+		return nil, status.Errorf(codes.Unimplemented, "Invalid case %s", query.GetQuery())
 	}
-
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
 
 	srv.queries[queryId] = &IncrementalQuery{
 		query:     query.GetQuery(),
@@ -512,7 +1062,7 @@ func (srv *IncrementalPollTestServer) PollFlightInfoPreparedStatement(ctx contex
 
 	testCase, ok := srv.testCases[req]
 	if !ok {
-		return nil, status.Errorf(codes.Unimplemented, fmt.Sprintf("Invalid case %s", req))
+		return nil, status.Errorf(codes.Unimplemented, "Invalid case %s", req)
 	}
 
 	srv.mu.Lock()
@@ -700,6 +1250,76 @@ func (ts *IncrementalPollTests) TestOptionValue() {
 	ts.Equal(adbc.StatusInvalidArgument, adbcErr.Code)
 }
 
+func (ts *IncrementalPollTests) TestAppMetadata() {
+	ctx, cancel := context.WithCancel(context.Background())
+	stmt, err := ts.cnxn.NewStatement()
+	ts.NoError(err)
+	defer stmt.Close()
+
+	ts.NoError(stmt.SetOption(adbc.OptionKeyIncremental, adbc.OptionValueEnabled))
+
+	ts.NoError(stmt.SetSqlQuery("infinite"))
+	_, partitions, _, err := stmt.ExecutePartitions(ctx)
+	ts.NoError(err)
+	ts.Equalf(uint64(1), partitions.NumPartitions, "%#v", partitions)
+
+	progress := 0.0
+	go func() {
+		var err error
+		var info []byte
+		for {
+			// While the below is stuck, we should be able to get the app metadata and progress
+			progress, err = stmt.(adbc.GetSetOptions).GetOptionDouble(adbc.OptionKeyProgress)
+			ts.NoError(err)
+
+			info, err = stmt.(adbc.GetSetOptions).GetOptionBytes(driver.OptionLastFlightInfo)
+			ts.NoError(err)
+			var flightInfo flight.FlightInfo
+			ts.NoError(proto.Unmarshal(info, &flightInfo))
+			ts.Equal([]byte("app metadata"), flightInfo.AppMetadata)
+
+			if progress > 0.03 {
+				break
+			}
+		}
+		cancel()
+	}()
+
+	// will get stuck forever, but will "make progress"
+	_, _, _, err = stmt.ExecutePartitions(ctx)
+	var adbcErr adbc.Error
+	ts.ErrorAs(err, &adbcErr)
+	ts.Equal(adbc.StatusCancelled, adbcErr.Code)
+}
+
+func (ts *IncrementalPollTests) TestUnavailable() {
+	// An error from the server should not tear down all the state.  We
+	// should be able to retry the request.
+	ctx := context.Background()
+	stmt, err := ts.cnxn.NewStatement()
+	ts.NoError(err)
+	defer stmt.Close()
+
+	ts.NoError(stmt.SetOption(adbc.OptionKeyIncremental, adbc.OptionValueEnabled))
+
+	ts.NoError(stmt.SetSqlQuery("unavailable"))
+	_, partitions, _, err := stmt.ExecutePartitions(ctx)
+	ts.NoError(err)
+	ts.Equalf(uint64(1), partitions.NumPartitions, "%#v", partitions)
+
+	_, partitions, _, err = stmt.ExecutePartitions(ctx)
+	ts.ErrorContains(err, "Server temporarily unavailable")
+	ts.Equal(uint64(0), partitions.NumPartitions)
+
+	_, partitions, _, err = stmt.ExecutePartitions(ctx)
+	ts.NoError(err)
+	ts.Equalf(uint64(1), partitions.NumPartitions, "%#v", partitions)
+
+	_, partitions, _, err = stmt.ExecutePartitions(ctx)
+	ts.NoError(err)
+	ts.Equal(uint64(0), partitions.NumPartitions)
+}
+
 func (ts *IncrementalPollTests) RunOneTestCase(ctx context.Context, stmt adbc.Statement, name string, testCase *IncrementalPollTestCase) {
 	opts := stmt.(adbc.GetSetOptions)
 
@@ -810,11 +1430,18 @@ func (ts *IncrementalPollTests) TestQueryTransaction() {
 
 type TimeoutTestServer struct {
 	flightsql.BaseServer
+	badPort  int
+	goodPort int
 }
 
 func (ts *TimeoutTestServer) DoGetStatement(ctx context.Context, tkt flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	if string(tkt.GetStatementHandle()) == "sleep and succeed" {
+	ticket := string(tkt.GetStatementHandle())
+	if ticket == "sleep and succeed" {
 		time.Sleep(1 * time.Second)
+	}
+
+	switch ticket {
+	case "bad endpoint", "sleep and succeed":
 		sc := arrow.NewSchema([]arrow.Field{{Name: "a", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, nil)
 		rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, sc, strings.NewReader(`[{"a": 5}]`))
 		if err != nil {
@@ -850,6 +1477,23 @@ func (ts *TimeoutTestServer) GetFlightInfoStatement(ctx context.Context, cmd fli
 	switch cmd.GetQuery() {
 	case "timeout":
 		<-ctx.Done()
+	case "bad endpoint":
+		tkt, _ := flightsql.CreateStatementQueryTicket([]byte("bad endpoint"))
+		info := &flight.FlightInfo{
+			FlightDescriptor: desc,
+			Endpoint: []*flight.FlightEndpoint{
+				{
+					Ticket: &flight.Ticket{Ticket: tkt},
+					Location: []*flight.Location{
+						{Uri: fmt.Sprintf("grpc://localhost:%d", ts.badPort)},
+						{Uri: fmt.Sprintf("grpc://localhost:%d", ts.goodPort)},
+					},
+				},
+			},
+			TotalRecords: -1,
+			TotalBytes:   -1,
+		}
+		return info, nil
 	case "fetch":
 		tkt, _ := flightsql.CreateStatementQueryTicket([]byte("fetch"))
 		info := &flight.FlightInfo{
@@ -884,10 +1528,23 @@ func (ts *TimeoutTestServer) CreatePreparedStatement(ctx context.Context, req fl
 
 type TimeoutTests struct {
 	ServerBasedTests
+	server net.Listener
 }
 
 func (suite *TimeoutTests) SetupSuite() {
-	suite.DoSetupSuite(&TimeoutTestServer{}, nil, nil)
+	var err error
+	suite.server, err = net.Listen("tcp", "localhost:0")
+	suite.NoError(err)
+
+	badPort := suite.server.Addr().(*net.TCPAddr).Port
+	server := &TimeoutTestServer{badPort: badPort}
+	suite.DoSetupSuite(server, nil, nil)
+	server.goodPort = suite.s.Addr().(*net.TCPAddr).Port
+}
+
+func (suite *TimeoutTests) TearDownSuite() {
+	suite.ServerBasedTests.TearDownSuite()
+	suite.NoError(suite.server.Close())
 }
 
 func (ts *TimeoutTests) TestInvalidValues() {
@@ -1073,6 +1730,27 @@ func (ts *TimeoutTests) TestDontTimeout() {
 	ts.Require().NoError(err)
 	defer expected.Release()
 	ts.Truef(array.RecordEqual(rec, expected), "expected: %s\nactual: %s", expected, rec)
+}
+
+func (ts *TimeoutTests) TestBadAddress() {
+	stmt, err := ts.cnxn.NewStatement()
+	ts.Require().NoError(err)
+	defer stmt.Close()
+	ts.Require().NoError(stmt.SetSqlQuery("bad endpoint"))
+
+	ts.Require().NoError(ts.db.(adbc.GetSetOptions).SetOptionDouble(driver.OptionTimeoutConnect, 5))
+
+	rr, _, err := stmt.ExecuteQuery(context.Background())
+	ts.Require().NoError(err)
+	defer rr.Release()
+
+	rr, _, err = stmt.ExecuteQuery(context.Background())
+	ts.Require().NoError(err)
+	defer rr.Release()
+
+	rr, _, err = stmt.ExecuteQuery(context.Background())
+	ts.Require().NoError(err)
+	defer rr.Release()
 }
 
 // ---- Cookie Tests --------------------
@@ -1327,7 +2005,7 @@ func (server *MultiTableTestServer) GetFlightInfoTables(ctx context.Context, cmd
 	server.Alloc = memory.NewCheckedAllocator(memory.DefaultAllocator)
 	info := &flight.FlightInfo{
 		Endpoint: []*flight.FlightEndpoint{
-			{Ticket: &flight.Ticket{Ticket: desc.Cmd}},
+			{Ticket: &flight.Ticket{Ticket: desc.Cmd}, Location: []*flight.Location{{Uri: flight.LocationReuseConnection}}},
 		},
 		FlightDescriptor: desc,
 		Schema:           flight.SerializeSchema(schema, server.Alloc),
@@ -1383,4 +2061,625 @@ func (suite *MultiTableTests) TestGetTableSchema() {
 
 	expectedSchema := arrow.NewSchema([]arrow.Field{{Name: "b", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, nil)
 	suite.Equal(expectedSchema, actualSchema)
+}
+
+// ---- Session Option Tests --------------------
+
+type SessionOptionTestServer struct {
+	flightsql.BaseServer
+	options map[string]interface{}
+}
+
+func (server *SessionOptionTestServer) GetSessionOptions(ctx context.Context, req *flight.GetSessionOptionsRequest) (*flight.GetSessionOptionsResult, error) {
+	options := make(map[string]*flight.SessionOptionValue)
+	for k, v := range server.options {
+		switch s := v.(type) {
+		case bool:
+			options[k] = &flight.SessionOptionValue{OptionValue: &flightproto.SessionOptionValue_BoolValue{BoolValue: s}}
+		case float64:
+			options[k] = &flight.SessionOptionValue{OptionValue: &flightproto.SessionOptionValue_DoubleValue{DoubleValue: s}}
+		case int64:
+			options[k] = &flight.SessionOptionValue{OptionValue: &flightproto.SessionOptionValue_Int64Value{Int64Value: s}}
+		case string:
+			options[k] = &flight.SessionOptionValue{OptionValue: &flightproto.SessionOptionValue_StringValue{StringValue: s}}
+		case []string:
+			options[k] = &flight.SessionOptionValue{OptionValue: &flightproto.SessionOptionValue_StringListValue_{StringListValue: &flightproto.SessionOptionValue_StringListValue{Values: s}}}
+		case nil:
+			options[k] = &flight.SessionOptionValue{}
+		default:
+			panic("not implemented")
+		}
+	}
+	return &flight.GetSessionOptionsResult{
+		SessionOptions: options,
+	}, nil
+}
+
+func (server *SessionOptionTestServer) SetSessionOptions(ctx context.Context, req *flight.SetSessionOptionsRequest) (*flight.SetSessionOptionsResult, error) {
+	errors := map[string]*flightproto.SetSessionOptionsResult_Error{}
+	for k, v := range req.SessionOptions {
+		switch k {
+		case "bad name":
+			errors[k] = &flightproto.SetSessionOptionsResult_Error{Value: flightproto.SetSessionOptionsResult_INVALID_NAME}
+			continue
+		case "bad value":
+			errors[k] = &flightproto.SetSessionOptionsResult_Error{Value: flightproto.SetSessionOptionsResult_INVALID_VALUE}
+			continue
+		case "error":
+			errors[k] = &flightproto.SetSessionOptionsResult_Error{Value: flightproto.SetSessionOptionsResult_ERROR}
+			continue
+		}
+		switch s := v.GetOptionValue().(type) {
+		case *flightproto.SessionOptionValue_BoolValue:
+			server.options[k] = s.BoolValue
+		case *flightproto.SessionOptionValue_DoubleValue:
+			server.options[k] = s.DoubleValue
+		case *flightproto.SessionOptionValue_Int64Value:
+			server.options[k] = s.Int64Value
+		case *flightproto.SessionOptionValue_StringValue:
+			server.options[k] = s.StringValue
+		case *flightproto.SessionOptionValue_StringListValue_:
+			server.options[k] = s.StringListValue.Values
+		case nil:
+			delete(server.options, k)
+		default:
+			return nil, status.Error(codes.InvalidArgument, "invalid option type")
+		}
+	}
+	return &flight.SetSessionOptionsResult{Errors: errors}, nil
+}
+
+func (server *SessionOptionTestServer) CloseSession(ctx context.Context, req *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+	return &flight.CloseSessionResult{
+		Status: flight.CloseSessionResultClosed,
+	}, nil
+}
+
+type SessionOptionTests struct {
+	ServerBasedTests
+}
+
+func (suite *SessionOptionTests) SetupSuite() {
+	suite.DoSetupSuite(&SessionOptionTestServer{
+		options: map[string]interface{}{
+			"string":     "expected",
+			"bool":       true,
+			"float64":    float64(1.5),
+			"int64":      int64(20),
+			"catalog":    "main",
+			"schema":     "session",
+			"stringlist": []string{"a", "b", "c"},
+			"nilopt":     nil,
+		},
+	}, nil, map[string]string{})
+}
+
+func (suite *SessionOptionTests) TestGetAllOptions() {
+	val, err := suite.cnxn.(adbc.GetSetOptions).GetOption(driver.OptionSessionOptions)
+	suite.NoError(err)
+
+	options := make(map[string]interface{})
+	suite.NoError(json.Unmarshal([]byte(val), &options))
+	// XXX: because Go decodes ints to strings by default. Should we use
+	// an alternate representation? What happens to int64max?
+	suite.Equal(float64(20), options["int64"])
+	suite.Equal("expected", options["string"])
+	// Bit of a hack, but lets servers send "this option exists, but is
+	// not set" by returning a nil/unset value
+	suite.Nil(options["nilopt"])
+}
+
+func (suite *SessionOptionTests) TestGetAllOptionsByte() {
+	val, err := suite.cnxn.(adbc.GetSetOptions).GetOptionBytes(driver.OptionSessionOptions)
+	suite.NoError(err)
+
+	options := make(map[string]interface{})
+	// XXX: maybe we can return the underlying proto repr here?
+	suite.NoError(json.Unmarshal(val, &options))
+	suite.Equal(float64(20), options["int64"])
+	suite.Equal("expected", options["string"])
+}
+
+func (suite *SessionOptionTests) TestGetSetCatalog() {
+	val, err := suite.cnxn.(adbc.GetSetOptions).GetOption(adbc.OptionKeyCurrentCatalog)
+	suite.NoError(err)
+	suite.Equal("main", val)
+
+	suite.NoError(suite.cnxn.(adbc.GetSetOptions).SetOption(adbc.OptionKeyCurrentCatalog, "postgres"))
+	val, err = suite.cnxn.(adbc.GetSetOptions).GetOption(adbc.OptionKeyCurrentCatalog)
+	suite.NoError(err)
+	suite.Equal("postgres", val)
+}
+
+func (suite *SessionOptionTests) TestGetSetSchema() {
+	val, err := suite.cnxn.(adbc.GetSetOptions).GetOption(adbc.OptionKeyCurrentDbSchema)
+	suite.NoError(err)
+	suite.Equal("session", val)
+
+	suite.NoError(suite.cnxn.(adbc.GetSetOptions).SetOption(adbc.OptionKeyCurrentDbSchema, "public"))
+	val, err = suite.cnxn.(adbc.GetSetOptions).GetOption(adbc.OptionKeyCurrentDbSchema)
+	suite.NoError(err)
+	suite.Equal("public", val)
+}
+
+func (suite *SessionOptionTests) TestGetSetBool() {
+	o := suite.cnxn.(adbc.GetSetOptions)
+	val, err := o.GetOption(driver.OptionBoolSessionOptionPrefix + "bool")
+	suite.NoError(err)
+	suite.Equal("true", val)
+
+	suite.NoError(o.SetOption(driver.OptionBoolSessionOptionPrefix+"bool", "false"))
+	val, err = o.GetOption(driver.OptionBoolSessionOptionPrefix + "bool")
+	suite.NoError(err)
+	suite.Equal("false", val)
+}
+
+func (suite *SessionOptionTests) TestGetSetFloat64() {
+	o := suite.cnxn.(adbc.GetSetOptions)
+	val, err := o.GetOptionDouble(driver.OptionSessionOptionPrefix + "float64")
+	suite.NoError(err)
+	suite.Equal(1.5, val)
+
+	suite.NoError(o.SetOptionDouble(driver.OptionSessionOptionPrefix+"float64", -42.0))
+	val, err = o.GetOptionDouble(driver.OptionSessionOptionPrefix + "float64")
+	suite.NoError(err)
+	suite.Equal(-42.0, val)
+}
+
+func (suite *SessionOptionTests) TestGetSetInt64() {
+	o := suite.cnxn.(adbc.GetSetOptions)
+	val, err := o.GetOptionInt(driver.OptionSessionOptionPrefix + "int64")
+	suite.NoError(err)
+	suite.Equal(int64(20), val)
+
+	suite.NoError(o.SetOptionInt(driver.OptionSessionOptionPrefix+"int64", 128))
+	val, err = o.GetOptionInt(driver.OptionSessionOptionPrefix + "int64")
+	suite.NoError(err)
+	suite.Equal(int64(128), val)
+}
+
+func (suite *SessionOptionTests) TestGetSetString() {
+	o := suite.cnxn.(adbc.GetSetOptions)
+	_, err := o.GetOption(driver.OptionSessionOptionPrefix + "unknown")
+	suite.ErrorContains(err, "unknown session option 'unknown'")
+
+	suite.NoError(o.SetOption(driver.OptionSessionOptionPrefix+"unknown", "42"))
+	val, err := o.GetOption(driver.OptionSessionOptionPrefix + "unknown")
+	suite.NoError(err)
+	suite.Equal("42", val)
+
+	suite.NoError(o.SetOption(driver.OptionEraseSessionOptionPrefix+"unknown", ""))
+	_, err = o.GetOption(driver.OptionSessionOptionPrefix + "unknown")
+	suite.ErrorContains(err, "unknown session option 'unknown'")
+
+	suite.ErrorContains(o.SetOption(driver.OptionSessionOptionPrefix+"bad name", ""), "Could not set option(s) 'bad name' (invalid name)")
+	suite.ErrorContains(o.SetOption(driver.OptionSessionOptionPrefix+"bad value", ""), "Could not set option(s) 'bad value' (invalid value)")
+	suite.ErrorContains(o.SetOption(driver.OptionSessionOptionPrefix+"error", ""), "Could not set option(s) 'error' (error setting option)")
+}
+
+func (suite *SessionOptionTests) TestGetSetStringList() {
+	o := suite.cnxn.(adbc.GetSetOptions)
+	val, err := o.GetOption(driver.OptionStringListSessionOptionPrefix + "stringlist")
+	suite.NoError(err)
+	suite.Equal(`["a","b","c"]`, val)
+
+	suite.NoError(o.SetOption(driver.OptionStringListSessionOptionPrefix+"stringlist", `["foo", "bar"]`))
+	val, err = o.GetOption(driver.OptionStringListSessionOptionPrefix + "stringlist")
+	suite.NoError(err)
+	suite.Equal(`["foo","bar"]`, val)
+
+	suite.NoError(o.SetOption(driver.OptionStringListSessionOptionPrefix+"stringlist", `[]`))
+	val, err = o.GetOption(driver.OptionStringListSessionOptionPrefix + "stringlist")
+	suite.NoError(err)
+	suite.Equal(`[]`, val)
+}
+
+// ---- GetObjects Tests --------------------
+
+type GetObjectsTestServer struct {
+	flightsql.BaseServer
+	catalogName string
+	schemaName  string
+	tableName   string
+	testData    map[string][]string
+}
+
+func (srv *GetObjectsTestServer) GetFlightInfoCatalogs(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	return srv.flightInfoForSchema(schema_ref.Catalogs, desc), nil
+}
+
+func (srv *GetObjectsTestServer) GetFlightInfoSchemas(ctx context.Context, cmd flightsql.GetDBSchemas, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	return srv.flightInfoForSchema(schema_ref.DBSchemas, desc), nil
+}
+
+func (srv *GetObjectsTestServer) GetFlightInfoTables(ctx context.Context, cmd flightsql.GetTables, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	return srv.flightInfoForSchema(schema_ref.TablesWithIncludedSchema, desc), nil
+}
+
+func (srv *GetObjectsTestServer) flightInfoForSchema(sc *arrow.Schema, desc *flight.FlightDescriptor) *flight.FlightInfo {
+	return &flight.FlightInfo{
+		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: desc.Cmd}}},
+		FlightDescriptor: desc,
+		Schema:           flight.SerializeSchema(sc, srv.Alloc),
+		TotalRecords:     -1,
+		TotalBytes:       -1,
+	}
+}
+
+func (srv *GetObjectsTestServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	// no catalogs
+	schema := schema_ref.Catalogs
+	ch := make(chan flight.StreamChunk, 1)
+	defer close(ch)
+	return schema, ch, nil
+}
+
+func (srv *GetObjectsTestServer) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	schemaBldr := array.NewBinaryBuilder(srv.Alloc, arrow.BinaryTypes.Binary)
+
+	columnFields := make([]arrow.Field, 0)
+	for key, val := range srv.testData {
+
+		bldr := flightsql.NewColumnMetadataBuilder()
+		defer bldr.Clear()
+
+		bldr.CatalogName(srv.catalogName)
+		bldr.SchemaName(srv.schemaName)
+		bldr.TableName(srv.tableName)
+		bldr.TypeName(val[0])
+		if val, err := strconv.ParseInt(val[2], 10, 32); err != nil {
+			panic(err)
+		} else {
+			bldr.Precision(int32(val))
+		}
+		if val, err := strconv.ParseInt(val[3], 10, 32); err != nil {
+			panic(err)
+		} else {
+			bldr.Scale(int32(val))
+		}
+		bldr.IsAutoIncrement(val[4] == "true")
+		bldr.IsCaseSensitive(val[5] == "true")
+		bldr.IsReadOnly(val[6] == "true")
+		bldr.IsSearchable(val[7] == "true")
+
+		colType, err := strconv.ParseInt(val[1], 10, 32)
+		if err != nil {
+			panic(err)
+		}
+		var fieldType arrow.DataType
+		switch colType {
+		case int64(arrow.PrimitiveTypes.Int32.ID()):
+			fieldType = arrow.PrimitiveTypes.Int32
+		case int64(arrow.PrimitiveTypes.Float32.ID()):
+			fieldType = arrow.PrimitiveTypes.Float32
+		case int64(arrow.PrimitiveTypes.Float64.ID()):
+			fieldType = arrow.PrimitiveTypes.Float64
+		default:
+			panic(fmt.Errorf("unknown column type %d", colType))
+		}
+
+		columnFields = append(columnFields, arrow.Field{
+			Name:     key,
+			Type:     fieldType,
+			Nullable: false,
+			Metadata: bldr.Metadata(),
+		})
+
+	}
+
+	schemaBldr.Append(flight.SerializeSchema(arrow.NewSchema(columnFields, nil), srv.Alloc))
+	schemaCol := schemaBldr.NewArray()
+	defer schemaCol.Release()
+
+	jsonStr := fmt.Sprintf(`[{"catalog_name": "%s", "db_schema_name": "%s", "table_name": "%s", "table_type": "TABLE"}]`,
+		srv.catalogName, // variable for catalog_name
+		srv.schemaName,  // variable for db_schema_name
+		srv.tableName)   // variable for table_type
+	tablesRecord, _, _ := array.RecordFromJSON(srv.Alloc, schema_ref.Tables, strings.NewReader(jsonStr))
+	defer tablesRecord.Release()
+
+	tablesRecordWithSchema := array.NewRecord(schema_ref.TablesWithIncludedSchema, append(tablesRecord.Columns(), schemaCol), tablesRecord.NumRows())
+	defer tablesRecordWithSchema.Release()
+
+	ch := make(chan flight.StreamChunk)
+
+	rdr, err := array.NewRecordReader(schema_ref.TablesWithIncludedSchema, []arrow.Record{tablesRecordWithSchema})
+	go flight.StreamChunksFromReader(rdr, ch)
+	return schema_ref.TablesWithIncludedSchema, ch, err
+}
+
+func (srv *GetObjectsTestServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	schema := schema_ref.DBSchemas
+	ch := make(chan flight.StreamChunk, 1)
+	// Not really a proper match, but good enough
+	catalogs, _, err := array.FromJSON(srv.Alloc, arrow.BinaryTypes.String, strings.NewReader(fmt.Sprintf(`["%s"]`, srv.catalogName)))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer catalogs.Release()
+
+	dbSchemas, _, err := array.FromJSON(srv.Alloc, arrow.BinaryTypes.String, strings.NewReader(fmt.Sprintf(`["%s"]`, srv.schemaName)))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer dbSchemas.Release()
+
+	batch := array.NewRecord(schema, []arrow.Array{catalogs, dbSchemas}, 1)
+	ch <- flight.StreamChunk{Data: batch}
+	close(ch)
+	return schema, ch, nil
+}
+
+type GetObjectsTests struct {
+	ServerBasedTests
+
+	catalogName string
+	schemaName  string
+	tableName   string
+}
+
+func (suite *GetObjectsTests) SetupSuite() {
+	srv := &GetObjectsTestServer{}
+	suite.catalogName = ""
+	suite.schemaName = "test_schema"
+	suite.tableName = "test_table"
+	srv.catalogName = suite.catalogName
+	srv.schemaName = suite.schemaName
+	srv.tableName = suite.tableName
+	srv.testData = map[string][]string{
+		"intcols": {
+			arrow.PrimitiveTypes.Int32.Name(),                  // TYPE_NAME
+			strconv.Itoa(int(arrow.PrimitiveTypes.Int32.ID())), // FieldType
+			strconv.Itoa(10),          // PRECISION
+			strconv.Itoa(15),          // SCALE
+			strconv.FormatBool(true),  // IS_AUTO_INCREMENT
+			strconv.FormatBool(false), // IS_CASE_SENSITIVE
+			strconv.FormatBool(true),  // IS_READ_ONLY
+			strconv.FormatBool(true),  // IS_SEARCHABLE
+		},
+		"floatcols": {
+			arrow.PrimitiveTypes.Float32.Name(),                  // TYPE_NAME
+			strconv.Itoa(int(arrow.PrimitiveTypes.Float32.ID())), // FieldType
+			strconv.Itoa(15),          // PRECISION
+			strconv.Itoa(15),          // SCALE
+			strconv.FormatBool(false), // IS_AUTO_INCREMENT
+			strconv.FormatBool(false), // IS_CASE_SENSITIVE
+			strconv.FormatBool(false), // IS_READ_ONLY
+			strconv.FormatBool(false), // IS_SEARCHABLE
+		},
+		"currencycol": {
+			"CURRENCY", // TYPE_NAME
+			strconv.Itoa(int(arrow.PrimitiveTypes.Float64.ID())), // FieldType
+			strconv.Itoa(15),          // PRECISION
+			strconv.Itoa(15),          // SCALE
+			strconv.FormatBool(false), // IS_AUTO_INCREMENT
+			strconv.FormatBool(false), // IS_CASE_SENSITIVE
+			strconv.FormatBool(false), // IS_READ_ONLY
+			strconv.FormatBool(false), // IS_SEARCHABLE
+		},
+	}
+	srv.Alloc = memory.NewCheckedAllocator(memory.DefaultAllocator)
+	suite.DoSetupSuite(srv, nil, nil)
+}
+
+// Testing metadata from flight driver is converted to xdbc metadata.
+// Ordering is being ignored to avoid flakiness as the order of the columns is not guaranteed.
+func (suite *GetObjectsTests) TestMetadataGetObjectsColumnsXdbc() {
+	tests := []struct {
+		name       string
+		columnName []string
+		//ordinalPosition           []string
+		remarks                   []string
+		xdbcDataType              []string
+		xdbcTypeName              []string
+		xdbcColumnSize            []string
+		xdbcDecimalDigits         []string
+		xdbcNumPrecRadix          []string
+		xdbcNullable              []string
+		xdbcColumnDef             []string
+		xdbcSqlDataType           []string
+		xdbcDatetimeSub           []string
+		xdbcCharOctetLength       []string
+		xdbcIsNullable            []string
+		xdbcScopeCatalog          []string
+		xdbcScopeSchema           []string
+		xdbcScopeTable            []string
+		xdbcIsAutoincrement       []string
+		xdbcIsAutogeneratedColumn []string
+	}{
+		{
+			fmt.Sprintf("%s.%s.%s", suite.catalogName, suite.schemaName, suite.tableName),
+			[]string{"currencycol", "floatcols", "intcols"}, //columnName
+			//[]string{"1", "2", "3"}, //ordinalPosition
+			[]string{"currencycol_", "floatcols_", "intcols_"}, //remarks
+			[]string{ //xdbcDataType
+				"currencycol_" + strconv.Itoa(int(internal.ToXdbcDataType(arrow.PrimitiveTypes.Float64))),
+				"floatcols_" + strconv.Itoa(int(internal.ToXdbcDataType(arrow.PrimitiveTypes.Float32))),
+				"intcols_" + strconv.Itoa(int(internal.ToXdbcDataType(arrow.PrimitiveTypes.Int32))),
+			},
+			[]string{ //xdbcTypeName
+				"currencycol_CURRENCY",
+				"floatcols_" + arrow.PrimitiveTypes.Float32.Name(),
+				"intcols_" + arrow.PrimitiveTypes.Int32.Name(),
+			},
+			[]string{"currencycol_0", "floatcols_0", "intcols_0"}, //xdbcColumnSize
+			[]string{"currencycol_0", "floatcols_0", "intcols_0"}, //xdbcDecimalDigits
+			[]string{"currencycol_0", "floatcols_0", "intcols_0"}, //xdbcNumPrecRadix
+			[]string{"currencycol_0", "floatcols_0", "intcols_0"}, //xdbcNullable
+			[]string{"currencycol_", "floatcols_", "intcols_"},    //xdbcColumnDef
+			[]string{ //xdbcSqlDataType
+				"currencycol_" + strconv.Itoa(int(internal.ToXdbcDataType(arrow.PrimitiveTypes.Float64))),
+				"floatcols_" + strconv.Itoa(int(internal.ToXdbcDataType(arrow.PrimitiveTypes.Float32))),
+				"intcols_" + strconv.Itoa(int(internal.ToXdbcDataType(arrow.PrimitiveTypes.Int32))),
+			},
+			[]string{"currencycol_0", "floatcols_0", "intcols_0"}, //xdbcDatetimeSub
+			[]string{"currencycol_0", "floatcols_0", "intcols_0"}, //xdbcCharOctetLength
+			[]string{"currencycol_", "floatcols_", "intcols_"},    //xdbcIsNullable
+			[]string{ //xdbcScopeCatalog
+				"currencycol_" + suite.catalogName,
+				"floatcols_" + suite.catalogName,
+				"intcols_" + suite.catalogName,
+			},
+			[]string{ //xdbcScopeSchema
+				"currencycol_" + suite.schemaName,
+				"floatcols_" + suite.schemaName,
+				"intcols_" + suite.schemaName,
+			},
+			[]string{ //xdbcScopeTable
+				"currencycol_" + suite.tableName,
+				"floatcols_" + suite.tableName,
+				"intcols_" + suite.tableName,
+			},
+			[]string{ //xdbcIsAutoincrement
+				"currencycol_false",
+				"floatcols_false",
+				"intcols_true",
+			},
+			[]string{ //xdbcIsAutogeneratedColumn
+				"currencycol_false",
+				"floatcols_false",
+				"intcols_false",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.name, func() {
+			rdr, err := suite.cnxn.GetObjects(context.Background(), adbc.ObjectDepthColumns, nil, nil, nil, nil, nil)
+			suite.Require().NoError(err)
+			defer rdr.Release()
+
+			suite.Truef(adbc.GetObjectsSchema.Equal(rdr.Schema()), "expected: %s\ngot: %s", adbc.GetObjectsSchema, rdr.Schema())
+			suite.True(rdr.Next())
+			rec := rdr.Record()
+			suite.Greater(rec.NumRows(), int64(0))
+			var (
+				foundExpected        = false
+				catalogDbSchemasList = rec.Column(1).(*array.List)
+				catalogDbSchemas     = catalogDbSchemasList.ListValues().(*array.Struct)
+				dbSchemaNames        = catalogDbSchemas.Field(0).(*array.String)
+				dbSchemaTablesList   = catalogDbSchemas.Field(1).(*array.List)
+				dbSchemaTables       = dbSchemaTablesList.ListValues().(*array.Struct)
+				tableColumnsList     = dbSchemaTables.Field(2).(*array.List)
+				tableColumns         = tableColumnsList.ListValues().(*array.Struct)
+
+				columnName = make([]string, 0)
+				//ordinalPosition           = make([]string, 0)
+				remarks                   = make([]string, 0)
+				xdbcDataType              = make([]string, 0)
+				xdbcTypeName              = make([]string, 0)
+				xdbcColumnSize            = make([]string, 0)
+				xdbcDecimalDigits         = make([]string, 0)
+				xdbcNumPrecRadix          = make([]string, 0)
+				xdbcNullable              = make([]string, 0)
+				xdbcColumnDef             = make([]string, 0)
+				xdbcSqlDataType           = make([]string, 0)
+				xdbcDatetimeSub           = make([]string, 0)
+				xdbcCharOctetLength       = make([]string, 0)
+				xdbcIsNullable            = make([]string, 0)
+				xdbcScopeCatalog          = make([]string, 0)
+				xdbcScopeSchema           = make([]string, 0)
+				xdbcScopeTable            = make([]string, 0)
+				xdbcIsAutoincrement       = make([]string, 0)
+				xdbcIsAutogeneratedColumn = make([]string, 0)
+			)
+			for row := 0; row < int(rec.NumRows()); row++ {
+				dbSchemaIdxStart, dbSchemaIdxEnd := catalogDbSchemasList.ValueOffsets(row)
+				for dbSchemaIdx := dbSchemaIdxStart; dbSchemaIdx < dbSchemaIdxEnd; dbSchemaIdx++ {
+					schemaName := dbSchemaNames.Value(int(dbSchemaIdx))
+					tblIdxStart, tblIdxEnd := dbSchemaTablesList.ValueOffsets(int(dbSchemaIdx))
+					for tblIdx := tblIdxStart; tblIdx < tblIdxEnd; tblIdx++ {
+						tableName := dbSchemaTables.Field(0).(*array.String).Value(int(tblIdx))
+
+						if strings.EqualFold(schemaName, suite.schemaName) && strings.EqualFold(suite.tableName, tableName) {
+							foundExpected = true
+
+							colIdxStart, colIdxEnd := tableColumnsList.ValueOffsets(int(tblIdx))
+							for colIdx := colIdxStart; colIdx < colIdxEnd; colIdx++ {
+								name := tableColumns.Field(0).(*array.String).Value(int(colIdx))
+								columnName = append(columnName, name)
+
+								// pos := tableColumns.Field(1).(*array.Int32).Value(int(colIdx))
+								// ordinalPosition = append(ordinalPosition, strconv.Itoa(int(pos)))
+
+								rm := tableColumns.Field(2).(*array.String).Value(int(colIdx))
+								remarks = append(remarks, name+"_"+rm)
+
+								xdt := tableColumns.Field(3).(*array.Int16).Value(int(colIdx))
+								xdbcDataType = append(xdbcDataType, name+"_"+strconv.Itoa(int(xdt)))
+
+								dataType := tableColumns.Field(4).(*array.String).Value(int(colIdx))
+								xdbcTypeName = append(xdbcTypeName, name+"_"+dataType)
+
+								columnSize := tableColumns.Field(5).(*array.Int32).Value(int(colIdx))
+								xdbcColumnSize = append(xdbcColumnSize, name+"_"+strconv.Itoa(int(columnSize)))
+
+								decimalDigits := tableColumns.Field(6).(*array.Int16).Value(int(colIdx))
+								xdbcDecimalDigits = append(xdbcDecimalDigits, name+"_"+strconv.Itoa(int(decimalDigits)))
+
+								numPrecRadix := tableColumns.Field(7).(*array.Int16).Value(int(colIdx))
+								xdbcNumPrecRadix = append(xdbcNumPrecRadix, name+"_"+strconv.Itoa(int(numPrecRadix)))
+
+								nullable := tableColumns.Field(8).(*array.Int16).Value(int(colIdx))
+								xdbcNullable = append(xdbcNullable, name+"_"+strconv.Itoa(int(nullable)))
+
+								columnDef := tableColumns.Field(9).(*array.String).Value(int(colIdx))
+								xdbcColumnDef = append(xdbcColumnDef, name+"_"+columnDef)
+
+								sqlType := tableColumns.Field(10).(*array.Int16).Value(int(colIdx))
+								xdbcSqlDataType = append(xdbcSqlDataType, name+"_"+strconv.Itoa(int(sqlType)))
+
+								dtPrec := tableColumns.Field(11).(*array.Int16).Value(int(colIdx))
+								xdbcDatetimeSub = append(xdbcDatetimeSub, name+"_"+strconv.Itoa(int(dtPrec)))
+
+								charOctetLen := tableColumns.Field(12).(*array.Int32).Value(int(colIdx))
+								xdbcCharOctetLength = append(xdbcCharOctetLength, name+"_"+strconv.Itoa(int(charOctetLen)))
+
+								isNullable := tableColumns.Field(13).(*array.String).Value(int(colIdx))
+								xdbcIsNullable = append(xdbcIsNullable, name+"_"+isNullable)
+
+								scopeCatalog := tableColumns.Field(14).(*array.String).Value(int(colIdx))
+								xdbcScopeCatalog = append(xdbcScopeCatalog, name+"_"+scopeCatalog)
+
+								scopeSchema := tableColumns.Field(15).(*array.String).Value(int(colIdx))
+								xdbcScopeSchema = append(xdbcScopeSchema, name+"_"+scopeSchema)
+
+								scopeTable := tableColumns.Field(16).(*array.String).Value(int(colIdx))
+								xdbcScopeTable = append(xdbcScopeTable, name+"_"+scopeTable)
+
+								isAutoIncrement := tableColumns.Field(17).(*array.Boolean).Value(int(colIdx))
+								xdbcIsAutoincrement = append(xdbcIsAutoincrement, name+"_"+strconv.FormatBool(isAutoIncrement))
+
+								isAutoGenerated := tableColumns.Field(18).(*array.Boolean).Value(int(colIdx))
+								xdbcIsAutogeneratedColumn = append(xdbcIsAutogeneratedColumn, name+"_"+strconv.FormatBool(isAutoGenerated))
+							}
+						}
+					}
+				}
+			}
+
+			suite.False(rdr.Next())
+			suite.True(foundExpected)
+
+			suite.ElementsMatch(tt.columnName, columnName, "columnName")
+			//suite.Equal(tt.ordinalPosition, ordinalPosition, "ordinalPosition")
+			suite.ElementsMatch(tt.remarks, remarks, "remarks")
+			suite.ElementsMatch(tt.xdbcDataType, xdbcDataType, "xdbcDataType")
+			suite.ElementsMatch(tt.xdbcTypeName, xdbcTypeName, "xdbcTypeName")
+			suite.ElementsMatch(tt.xdbcColumnSize, xdbcColumnSize, "xdbcColumnSize")
+			suite.ElementsMatch(tt.xdbcDecimalDigits, xdbcDecimalDigits, "xdbcDecimalDigits")
+			suite.ElementsMatch(tt.xdbcNumPrecRadix, xdbcNumPrecRadix, "xdbcNumPrecRadix")
+			suite.ElementsMatch(tt.xdbcNullable, xdbcNullable, "xdbcNullable")
+			suite.ElementsMatch(tt.xdbcColumnDef, xdbcColumnDef, "xdbcColumnDef")
+			suite.ElementsMatch(tt.xdbcSqlDataType, xdbcSqlDataType, "xdbcSqlDataType")
+			suite.ElementsMatch(tt.xdbcDatetimeSub, xdbcDatetimeSub, "xdbcDatetimeSub")
+			suite.ElementsMatch(tt.xdbcCharOctetLength, xdbcCharOctetLength, "xdbcCharOctetLength")
+			suite.ElementsMatch(tt.xdbcIsNullable, xdbcIsNullable, "xdbcIsNullable")
+			suite.ElementsMatch(tt.xdbcScopeCatalog, xdbcScopeCatalog, "xdbcScopeCatalog")
+			suite.ElementsMatch(tt.xdbcScopeSchema, xdbcScopeSchema, "xdbcScopeSchema")
+			suite.ElementsMatch(tt.xdbcScopeTable, xdbcScopeTable, "xdbcScopeTable")
+			suite.ElementsMatch(tt.xdbcIsAutoincrement, xdbcIsAutoincrement, "xdbcIsAutoincrement")
+			suite.ElementsMatch(tt.xdbcIsAutogeneratedColumn, xdbcIsAutogeneratedColumn, "xdbcIsAutogeneratedColumn")
+		})
+	}
 }

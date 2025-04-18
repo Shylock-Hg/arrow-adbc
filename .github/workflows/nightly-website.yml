@@ -22,14 +22,19 @@ on:
     branches:
       - main
     tags:
-      - 'apache-arrow-adbc-*'
-      - '!apache-arrow-adbc-*-rc*'
+      - "apache-arrow-adbc-*"
+      - "!apache-arrow-adbc-*-rc*"
   workflow_dispatch: {}
 
 # Ensure concurrent builds don't stomp on each other
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}
   cancel-in-progress: false
+
+defaults:
+  run:
+    # 'bash' will expand to -eo pipefail
+    shell: bash
 
 jobs:
   build:
@@ -41,11 +46,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Build
-        shell: bash
         run: |
-          docker-compose run docs
+          docker compose run docs
       - name: Archive docs
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: docs
           retention-days: 2
@@ -70,12 +74,16 @@ jobs:
           path: scripts
           persist-credentials: false
       - name: Download docs
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: docs
           path: temp
+      # To use pip below, we need to install our own Python; the system Python's
+      # pip won't let us install packages without a scary flag.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - name: Build
-        shell: bash
         run: |
           pip install sphobjinv
           ./scripts/ci/scripts/website_build.sh "$(pwd)/scripts" "$(pwd)/site" "$(pwd)/temp"

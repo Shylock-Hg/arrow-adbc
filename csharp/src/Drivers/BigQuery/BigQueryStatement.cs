@@ -16,17 +16,16 @@
 */
 
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Data.SqlTypes;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using Google.Api.Gax;
 using Google.Apis.Auth.OAuth2;
+using Google.Apis.Bigquery.v2.Data;
 using Google.Cloud.BigQuery.Storage.V1;
 using Google.Cloud.BigQuery.V2;
 using TableFieldSchema = Google.Apis.Bigquery.v2.Data.TableFieldSchema;
@@ -52,28 +51,111 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
 
         public override QueryResult ExecuteQuery()
         {
-            QueryOptions? queryOptions = ValidateOptions();
+            // Create job
+            QueryOptions queryOptions = ValidateOptions();
             BigQueryJob job = this.client.CreateQueryJob(SqlQuery, null, queryOptions);
-            BigQueryResults results = job.GetQueryResults();
 
+            // Get results
+            GetQueryResultsOptions getQueryResultsOptions = new GetQueryResultsOptions();
+            if (this.Options?.TryGetValue(BigQueryParameters.GetQueryResultsOptionsTimeout, out string? timeoutSeconds) == true &&
+                int.TryParse(timeoutSeconds, out int seconds) &&
+                seconds >= 0)
+            {
+                getQueryResultsOptions.Timeout = TimeSpan.FromSeconds(seconds);
+            }
+            BigQueryResults results = job.GetQueryResults(getQueryResultsOptions);
+
+            // For multi-statement queries, the results.TableReference is null
+            if (results.TableReference == null)
+            {
+                string statementType = string.Empty;
+                if (this.Options?.TryGetValue(BigQueryParameters.StatementType, out string? statementTypeString) == true)
+                {
+                    statementType = statementTypeString;
+                }
+                int statementIndex = 1;
+                if (this.Options?.TryGetValue(BigQueryParameters.StatementIndex, out string? statementIndexString) == true &&
+                    int.TryParse(statementIndexString, out int statementIndexInt) &&
+                    statementIndexInt > 0)
+                {
+                    statementIndex = statementIndexInt;
+                }
+                string evaluationKind = string.Empty;
+                if (this.Options?.TryGetValue(BigQueryParameters.EvaluationKind, out string? evaluationKindString) == true)
+                {
+                    evaluationKind = evaluationKindString;
+                }
+
+                // To get the results of all statements in a multi-statement query, enumerate the child jobs. Related public docs: https://cloud.google.com/bigquery/docs/multi-statement-queries#get_all_executed_statements.
+                // Can filter by StatementType and EvaluationKind. Related public docs: https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#jobstatistics2, https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#evaluationkind
+                ListJobsOptions listJobsOptions = new ListJobsOptions();
+                listJobsOptions.ParentJobId = results.JobReference.JobId;
+                var joblist = client.ListJobs(listJobsOptions)
+                    .Select(job => client.GetJob(job.Reference))
+                    .Where(job => string.IsNullOrEmpty(evaluationKind) || job.Statistics.ScriptStatistics.EvaluationKind.Equals(evaluationKind, StringComparison.OrdinalIgnoreCase))
+                    .Where(job => string.IsNullOrEmpty(statementType) || job.Statistics.Query.StatementType.Equals(statementType,StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(job => job.Resource.Statistics.CreationTime)
+                    .ToList();
+
+                if (joblist.Count > 0)
+                {
+                    if (statementIndex < 1 || statementIndex > joblist.Count)
+                    {
+                        throw new ArgumentOutOfRangeException($"The specified index {statementIndex} is out of range. There are {joblist.Count} jobs available.");
+                    }
+                    results = joblist[statementIndex - 1].GetQueryResults(getQueryResultsOptions);
+                }
+            }
+            if (results.TableReference == null)
+            {
+                throw new AdbcException("There is no query statement");
+            }
+
+            // BigQuery Read Client for streaming
             BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
             readClientBuilder.Credential = this.credential;
             BigQueryReadClient readClient = readClientBuilder.Build();
-
             string table = $"projects/{results.TableReference.ProjectId}/datasets/{results.TableReference.DatasetId}/tables/{results.TableReference.TableId}";
-
+            int maxStreamCount = 1;
+            if (this.Options?.TryGetValue(BigQueryParameters.MaxFetchConcurrency, out string? maxStreamCountString) == true)
+            {
+                if (int.TryParse(maxStreamCountString, out int count))
+                {
+                    if (count >= 0)
+                    {
+                        maxStreamCount = count;
+                    }
+                }
+            }
             ReadSession rs = new ReadSession { Table = table, DataFormat = DataFormat.Arrow };
-            ReadSession rrs = readClient.CreateReadSession("projects/" + results.TableReference.ProjectId, rs, 1);
-
+            ReadSession rrs = readClient.CreateReadSession("projects/" + results.TableReference.ProjectId, rs, maxStreamCount);
             long totalRows = results.TotalRows == null ? -1L : (long)results.TotalRows.Value;
-            IArrowArrayStream stream = new MultiArrowReader(TranslateSchema(results.Schema), rrs.Streams.Select(s => ReadChunk(readClient, s.Name)));
-
+            var readers = rrs.Streams
+                             .Select(s => ReadChunk(readClient, s.Name))
+                             .Where(chunk => chunk != null)
+                             .Cast<IArrowReader>();
+            IArrowArrayStream stream = new MultiArrowReader(TranslateSchema(results.Schema), readers);
             return new QueryResult(totalRows, stream);
         }
 
         public override UpdateResult ExecuteUpdate()
         {
-            BigQueryResults result = this.client.ExecuteQuery(SqlQuery, parameters: null);
+            QueryOptions options = ValidateOptions();
+            GetQueryResultsOptions getQueryResultsOptions = new GetQueryResultsOptions();
+
+            if (this.Options?.TryGetValue(BigQueryParameters.GetQueryResultsOptionsTimeout, out string? timeoutSeconds) == true &&
+                int.TryParse(timeoutSeconds, out int seconds) &&
+                seconds >= 0)
+            {
+                getQueryResultsOptions.Timeout = TimeSpan.FromSeconds(seconds);
+            }
+
+            BigQueryResults result = this.client.ExecuteQuery(
+                SqlQuery,
+                parameters: null,
+                queryOptions: options,
+                resultsOptions: getQueryResultsOptions);
+
             long updatedRows = result.NumDmlAffectedRows == null ? -1L : result.NumDmlAffectedRows.Value;
 
             return new UpdateResult(updatedRows);
@@ -87,19 +169,6 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
         private Field TranslateField(TableFieldSchema field)
         {
             return new Field(field.Name, TranslateType(field), field.Mode == "NULLABLE");
-        }
-
-        public override object GetValue(IArrowArray arrowArray, int index)
-        {
-            switch (arrowArray)
-            {
-                case StructArray structArray:
-                    return SerializeToJson(structArray, index);
-                case ListArray listArray:
-                    return listArray.GetSlicedValues(index);
-                default:
-                    return base.GetValue(arrowArray, index);
-            }
         }
 
         private IArrowType TranslateType(TableFieldSchema field)
@@ -125,10 +194,9 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
                 case "TIME":
                     return GetType(field, Time64Type.Default);
                 case "DATE":
-                    return GetType(field, Date64Type.Default);
+                    return GetType(field, Date32Type.Default);
                 case "RECORD" or "STRUCT":
-                    // its a json string
-                    return GetType(field, StringType.Default);
+                    return GetType(field, BuildStructType(field));
 
                 // treat these values as strings
                 case "GEOGRAPHY" or "JSON":
@@ -152,6 +220,19 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
             }
         }
 
+        private StructType BuildStructType(TableFieldSchema field)
+        {
+            List<Field> arrowFields = new List<Field>();
+
+            foreach (TableFieldSchema subfield in field.Fields)
+            {
+                Field arrowField = TranslateField(subfield);
+                arrowFields.Add(arrowField);
+            }
+
+            return new StructType(arrowFields.AsReadOnly());
+        }
+
         private IArrowType GetType(TableFieldSchema field, IArrowType type)
         {
             if (field.Mode == "REPEATED")
@@ -160,30 +241,85 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
             return type;
         }
 
-        static IArrowReader ReadChunk(BigQueryReadClient readClient, string streamName)
+        static IArrowReader? ReadChunk(BigQueryReadClient readClient, string streamName)
         {
             // Ideally we wouldn't need to indirect through a stream, but the necessary APIs in Arrow
             // are internal. (TODO: consider changing Arrow).
-            BigQueryReadClient.ReadRowsStream readRowsStream = readClient.ReadRows(new ReadRowsRequest { ReadStream = streamName  });
+            BigQueryReadClient.ReadRowsStream readRowsStream = readClient.ReadRows(new ReadRowsRequest { ReadStream = streamName });
             IAsyncEnumerator<ReadRowsResponse> enumerator = readRowsStream.GetResponseStream().GetAsyncEnumerator();
 
             ReadRowsStream stream = new ReadRowsStream(enumerator);
 
-            return new ArrowStreamReader(stream);
+            if (stream.HasRows)
+            {
+                return new ArrowStreamReader(stream);
+            }
+            else
+            {
+                return null;
+            }
         }
 
-        private QueryOptions? ValidateOptions()
+        private QueryOptions ValidateOptions()
         {
-            if (this.Options == null || this.Options.Count == 0)
-                return null;
-
             QueryOptions options = new QueryOptions();
 
-            foreach (KeyValuePair<string,string> keyValuePair in this.Options)
+            if (this.client.ProjectId == BigQueryConstants.DetectProjectId)
+            {
+                // An error occurs when calling CreateQueryJob without the ID set,
+                // so use the first one that is found. This does not prevent from calling
+                // to other 'project IDs' (catalogs) with a query.
+                PagedEnumerable<ProjectList, CloudProject>? projects = this.client.ListProjects();
+
+                if (projects != null)
+                {
+                    string? firstProjectId = projects.Select(x => x.ProjectId).FirstOrDefault();
+
+                    if (firstProjectId != null)
+                    {
+                        options.ProjectId = firstProjectId;
+                    }
+                }
+            }
+
+            if (this.Options == null || this.Options.Count == 0)
+                return options;
+
+            foreach (KeyValuePair<string, string> keyValuePair in this.Options)
             {
                 if (keyValuePair.Key == BigQueryParameters.AllowLargeResults)
                 {
                     options.AllowLargeResults = true ? keyValuePair.Value.ToLower().Equals("true") : false;
+                }
+                if (keyValuePair.Key == BigQueryParameters.LargeResultsDestinationTable)
+                {
+                    string destinationTable = keyValuePair.Value;
+
+                    if (!destinationTable.Contains("."))
+                        throw new InvalidOperationException($"{BigQueryParameters.LargeResultsDestinationTable} is invalid");
+
+                    string projectId = string.Empty;
+                    string datasetId = string.Empty;
+                    string tableId = string.Empty;
+
+                    string[] segments = destinationTable.Split('.');
+
+                    if (segments.Length != 3)
+                        throw new InvalidOperationException($"{BigQueryParameters.LargeResultsDestinationTable} cannot be parsed");
+
+                    projectId = segments[0];
+                    datasetId = segments[1];
+                    tableId = segments[2];
+
+                    if (string.IsNullOrEmpty(projectId.Trim()) || string.IsNullOrEmpty(datasetId.Trim()) || string.IsNullOrEmpty(tableId.Trim()))
+                        throw new InvalidOperationException($"{BigQueryParameters.LargeResultsDestinationTable} contains invalid values");
+
+                    options.DestinationTable = new TableReference()
+                    {
+                        ProjectId = projectId,
+                        DatasetId = datasetId,
+                        TableId = tableId
+                    };
                 }
                 if (keyValuePair.Key == BigQueryParameters.UseLegacySQL)
                 {
@@ -192,136 +328,6 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
             }
             return options;
         }
-
-        private string SerializeToJson(StructArray structArray, int index)
-        {
-            Dictionary<String, object> jsonDictionary = ParseStructArray(structArray, index);
-
-            return JsonSerializer.Serialize(jsonDictionary);
-        }
-
-        private Dictionary<String, object> ParseStructArray(StructArray structArray, int index)
-        {
-            Dictionary<String, object> jsonDictionary = new Dictionary<String, object>();
-            StructType structType = (StructType)structArray.Data.DataType;
-            for (int i = 0; i < structArray.Data.Children.Length; i++)
-            {
-                string name = structType.Fields[i].Name;
-                object value = GetValue(structArray.Fields[i], index);
-
-                if (value is StructArray structArray1)
-                {
-                    List<Dictionary<string, object>> children = new List<Dictionary<string, object>>();
-
-                    if (structArray1.Length > 1)
-                    {
-                        for (int j = 0; j < structArray1.Length; j++)
-                            children.Add(ParseStructArray(structArray1, j));
-                    }
-
-                    if (children.Count > 0)
-                    {
-                        jsonDictionary.Add(name, children);
-                    }
-                    else
-                    {
-                        jsonDictionary.Add(name, ParseStructArray(structArray1, index));
-                    }
-                }
-                else if (value is IArrowArray arrowArray)
-                {
-                    IList? values = CreateList(arrowArray);
-
-                    if (values != null)
-                    {
-                        for (int j = 0; j < arrowArray.Length; j++)
-                        {
-                            values.Add(base.GetValue(arrowArray, j));
-                        }
-
-                        jsonDictionary.Add(name, values);
-                    }
-                    else
-                    {
-                        jsonDictionary.Add(name, new List<object>());
-                    }
-                }
-                else
-                {
-                    jsonDictionary.Add(name, value);
-                }
-            }
-
-            return jsonDictionary;
-        }
-
-        private IList? CreateList(IArrowArray arrowArray)
-        {
-            if (arrowArray == null) throw new ArgumentNullException(nameof(arrowArray));
-
-            switch (arrowArray)
-            {
-                case BooleanArray booleanArray:
-                    return new List<bool>();
-                case Date32Array date32Array:
-                case Date64Array date64Array:
-                    return new List<DateTime>();
-                case Decimal128Array decimal128Array:
-                    return new List<SqlDecimal>();
-                case Decimal256Array decimal256Array:
-                    return new List<string>();
-                case DoubleArray doubleArray:
-                    return new List<double>();
-                case FloatArray floatArray:
-                    return new List<float>();
-#if NET5_0_OR_GREATER
-                case PrimitiveArray<Half> halfFloatArray:
-                    return new List<Half>();
-#endif
-                case Int8Array int8Array:
-                    return new List<sbyte>();
-                case Int16Array int16Array:
-                    return new List<short>();
-                case Int32Array int32Array:
-                    return new List<int>();
-                case Int64Array int64Array:
-                    return new List<long>();
-                case StringArray stringArray:
-                    return new List<string>();
-#if NET6_0_OR_GREATER
-                case Time32Array time32Array:
-                case Time64Array time64Array:
-                    return new List<TimeOnly>();
-#else
-                case Time32Array time32Array:
-                case Time64Array time64Array:
-                    return new List<TimeSpan>();
-#endif
-                case TimestampArray timestampArray:
-                    return new List<DateTimeOffset>();
-                case UInt8Array uInt8Array:
-                    return new List<byte>();
-                case UInt16Array uInt16Array:
-                    return new List<ushort>();
-                case UInt32Array uInt32Array:
-                    return new List<uint>();
-                case UInt64Array uInt64Array:
-                    return new List<ulong>();
-
-                case BinaryArray binaryArray:
-                    return new List<byte>();
-
-                    // not covered:
-                    // -- struct array
-                    // -- dictionary array
-                    // -- fixed size binary
-                    // -- list array
-                    // -- union array
-            }
-
-            return null;
-        }
-
 
         class MultiArrowReader : IArrowArrayStream
         {
@@ -337,7 +343,7 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
 
             public Schema Schema { get { return schema; } }
 
-            public async ValueTask<RecordBatch> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
+            public async ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
             {
                 if (this.readers == null)
                 {
@@ -383,14 +389,27 @@ namespace Apache.Arrow.Adbc.Drivers.BigQuery
             ReadOnlyMemory<byte> currentBuffer;
             bool first;
             int position;
+            bool hasRows;
 
             public ReadRowsStream(IAsyncEnumerator<ReadRowsResponse> response)
             {
                 if (!response.MoveNextAsync().Result) { }
-                this.currentBuffer = response.Current.ArrowSchema.SerializedSchema.Memory;
+
+                if (response.Current != null)
+                {
+                    this.currentBuffer = response.Current.ArrowSchema.SerializedSchema.Memory;
+                    this.hasRows = true;
+                }
+                else
+                {
+                    this.hasRows = false;
+                }
+
                 this.response = response;
                 this.first = true;
             }
+
+            public bool HasRows => this.hasRows;
 
             public override bool CanRead => true;
 
