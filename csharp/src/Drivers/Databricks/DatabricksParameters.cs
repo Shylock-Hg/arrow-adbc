@@ -141,6 +141,13 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
         /// This is the client secret you obtained when registering your application with Databricks.
         /// </summary>
         public const string OAuthClientSecret = "adbc.databricks.oauth.client_secret";
+
+        /// <summary>
+        /// The OAuth scope for client credentials flow.
+        /// Optional when grant_type is "client_credentials".
+        /// Default value is "sql" if not specified.
+        /// </summary>
+        public const string OAuthScope = "adbc.databricks.oauth.scope";
     }
 
     /// <summary>
@@ -148,6 +155,11 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
     /// </summary>
     public class DatabricksConstants
     {
+        /// <summary>
+        /// Default heartbeat interval in seconds for long-running operations
+        /// </summary>
+        public const int DefaultOperationStatusPollingIntervalSeconds = 60;
+
         /// <summary>
         /// OAuth grant type constants
         /// </summary>
