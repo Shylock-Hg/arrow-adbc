@@ -330,11 +330,425 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Databricks
             Assert.Equal(TestConfiguration.Metadata.ExpectedColumnCount, actualBatchLength);
         }
 
+        [SkippableFact]
+        public async Task CanGetColumnsExtended()
+        {
+            // Get the runtime version using GetInfo
+            var infoCodes = new List<AdbcInfoCode> { AdbcInfoCode.VendorVersion };
+            var infoValues = Connection.GetInfo(infoCodes);
+
+            // Set up statement for GetColumnsExtended
+            var statement = Connection.CreateStatement();
+            statement.SetOption(ApacheParameters.IsMetadataCommand, "true");
+            statement.SetOption(ApacheParameters.CatalogName, TestConfiguration.Metadata.Catalog);
+            statement.SetOption(ApacheParameters.SchemaName, TestConfiguration.Metadata.Schema);
+            statement.SetOption(ApacheParameters.TableName, TestConfiguration.Metadata.Table);
+            statement.SqlQuery = "GetColumnsExtended";
+
+            QueryResult queryResult = await statement.ExecuteQueryAsync();
+            Assert.NotNull(queryResult.Stream);
+
+            // Verify schema has more fields than the regular GetColumns result (which has 24 fields)
+            // We expect additional PK and FK fields
+            OutputHelper?.WriteLine($"Column count in result schema: {queryResult.Stream.Schema.FieldsList.Count}");
+            Assert.True(queryResult.Stream.Schema.FieldsList.Count > 24,
+                "GetColumnsExtended should return more columns than GetColumns (at least 24+)");
+
+            // Verify that key fields from each original metadata call are present
+            bool hasColumnName = false;
+            bool hasPkKeySeq = false;
+            bool hasFkTableName = false;
+
+            foreach (var field in queryResult.Stream.Schema.FieldsList)
+            {
+                OutputHelper?.WriteLine($"Field in schema: {field.Name} ({field.DataType})");
+
+                if (field.Name.Equals("COLUMN_NAME", StringComparison.OrdinalIgnoreCase))
+                    hasColumnName = true;
+                else if (field.Name.Equals("PK_COLUMN_NAME", StringComparison.OrdinalIgnoreCase))
+                    hasPkKeySeq = true;
+                else if (field.Name.Equals("FK_PKTABLE_NAME", StringComparison.OrdinalIgnoreCase))
+                    hasFkTableName = true;
+            }
+
+            Assert.True(hasColumnName, "Schema should contain COLUMN_NAME field from GetColumns");
+            Assert.True(hasPkKeySeq, "Schema should contain PK_KEY_SEQ field from GetPrimaryKeys");
+            Assert.True(hasFkTableName, "Schema should contain FK_PKTABLE_NAME field from GetCrossReference");
+
+            // Read and verify data
+            int rowCount = 0;
+            while (queryResult.Stream != null)
+            {
+                RecordBatch? batch = await queryResult.Stream.ReadNextRecordBatchAsync();
+                if (batch == null) break;
+
+                rowCount += batch.Length;
+
+                // Output rows for debugging (limit to first 10)
+                if (batch.Length > 0)
+                {
+                    int rowsToPrint = Math.Min(batch.Length, 10); // Limit to 10 rows
+                    OutputHelper?.WriteLine($"Found {batch.Length} rows, showing first {rowsToPrint}:");
+
+                    for (int rowIndex = 0; rowIndex < rowsToPrint; rowIndex++)
+                    {
+                        OutputHelper?.WriteLine($"Row {rowIndex}:");
+                        for (int i = 0; i < batch.ColumnCount; i++)
+                        {
+                            string fieldName = queryResult.Stream.Schema.FieldsList[i].Name;
+                            string fieldValue = GetStringValue(batch.Column(i), rowIndex);
+                            OutputHelper?.WriteLine($"  {fieldName}: {fieldValue}");
+                        }
+                        OutputHelper?.WriteLine(""); // Add blank line between rows
+                    }
+                }
+            }
+
+            // Verify we got rows matching the expected column count
+            Assert.Equal(TestConfiguration.Metadata.ExpectedColumnCount, rowCount);
+            OutputHelper?.WriteLine($"Successfully retrieved {rowCount} columns with extended information");
+        }
+
+        // Helper method to get string representation of array values
+        private string GetStringValue(IArrowArray array, int index)
+        {
+            if (array == null || index >= array.Length || array.IsNull(index))
+                return "null";
+
+            if (array is StringArray strArray)
+                return strArray.GetString(index) ?? "null";
+            else if (array is Int32Array int32Array)
+                return int32Array.GetValue(index).ToString() ?? "null";
+            else if (array is Int16Array int16Array)
+                return int16Array.GetValue(index).ToString() ?? "null";
+            else if (array is BooleanArray boolArray)
+                return boolArray.GetValue(index).ToString() ?? "null";
+
+            return "unknown";
+        }
+
         protected override void PrepareCreateTableWithPrimaryKeys(out string sqlUpdate, out string tableNameParent, out string fullTableNameParent, out IReadOnlyList<string> primaryKeys)
         {
             CreateNewTableName(out tableNameParent, out fullTableNameParent);
             sqlUpdate = $"CREATE TABLE IF NOT EXISTS {fullTableNameParent} (INDEX INT, NAME STRING, PRIMARY KEY (INDEX, NAME))";
             primaryKeys = ["index", "name"];
+        }
+
+        // NOTE: this is a thirty minute test. As of writing, databricks commands have 20 minutes of idle time (and checked every 5 mintues)
+        [SkippableTheory]
+        [InlineData(false, "CloudFetch disabled")] // TODO: test cloudfetch enabled
+        public async Task StatusPollerKeepsQueryAlive(bool useCloudFetch, string configName)
+        {
+            OutputHelper?.WriteLine($"Testing status poller with long delay between reads ({configName})");
+
+            // Create a connection using the test configuration
+            var connectionParams = new Dictionary<string, string>
+            {
+                [DatabricksParameters.UseCloudFetch] = useCloudFetch.ToString().ToLower()
+            };
+            using AdbcConnection connection = NewConnection(TestConfiguration, connectionParams);
+            using var statement = connection.CreateStatement();
+
+            // Execute a query that should return data - using a larger dataset to ensure multiple batches
+            statement.SqlQuery = "SELECT id, CAST(id AS STRING) as id_string, id * 2 as id_doubled FROM RANGE(3000000)";
+            QueryResult result = statement.ExecuteQuery();
+
+            Assert.NotNull(result.Stream);
+
+            // Simulate a long delay (30 minutes)
+            OutputHelper?.WriteLine("Simulating 30 minute delay...");
+            await Task.Delay(TimeSpan.FromMinutes(30));
+
+            // Read remaining batches
+            int totalRows = 0;
+            int batchCount = 0;
+
+            while (result.Stream != null)
+            {
+                using var batch = await result.Stream.ReadNextRecordBatchAsync();
+                if (batch == null)
+                    break;
+
+                batchCount++;
+                totalRows += batch.Length;
+                OutputHelper?.WriteLine($"Batch {batchCount}: Read {batch.Length} rows");
+            }
+
+            // Verify we got all rows
+            Assert.Equal(3000000, totalRows);
+            Assert.True(batchCount > 1, "Should have read multiple batches");
+            OutputHelper?.WriteLine($"Successfully read {totalRows} rows in {batchCount} batches after 30 minute delay with {configName}");
+        }
+
+        [SkippableTheory]
+        [InlineData("true", true)]  // Should allow multiple catalogs
+        [InlineData("false", false)] // Should only use default catalog
+        public async Task EnableMultipleCatalogSupportAffectsMetadataQueries(string enableMultipleCatalogSupport, bool shouldAllowMultipleCatalogs)
+        {
+            // Create a connection with the specified EnableMultipleCatalogSupport setting
+            var testConfig = (DatabricksTestConfiguration)TestConfiguration.Clone();
+            testConfig.EnableMultipleCatalogSupport = enableMultipleCatalogSupport;
+            using var connection = NewConnection(testConfig);
+
+            // Store SPARK catalog schemas for comparison
+            Dictionary<string, Schema> sparkSchemas = new Dictionary<string, Schema>();
+
+            // First run with SPARK catalog to get real schemas
+            await TestMetadataQuery(connection, "GetCatalogs", shouldAllowMultipleCatalogs, "SPARK", sparkSchemas);
+            await TestMetadataQuery(connection, "GetSchemas", shouldAllowMultipleCatalogs, "SPARK", sparkSchemas);
+            await TestMetadataQuery(connection, "GetTables", shouldAllowMultipleCatalogs, "SPARK", sparkSchemas);
+            await TestMetadataQuery(connection, "GetColumns", shouldAllowMultipleCatalogs, "SPARK", sparkSchemas);
+
+            // Then run with non-SPARK catalog and compare schemas
+            await TestMetadataQuery(connection, "GetCatalogs", shouldAllowMultipleCatalogs, "main", sparkSchemas);
+            await TestMetadataQuery(connection, "GetSchemas", shouldAllowMultipleCatalogs, "main", sparkSchemas);
+            await TestMetadataQuery(connection, "GetTables", shouldAllowMultipleCatalogs, "main", sparkSchemas);
+            await TestMetadataQuery(connection, "GetColumns", shouldAllowMultipleCatalogs, "main", sparkSchemas);
+        }
+
+        private async Task TestMetadataQuery(AdbcConnection connection, string queryType, bool shouldAllowMultipleCatalogs, string catalogName, Dictionary<string, Schema> sparkSchemas)
+        {
+            OutputHelper?.WriteLine($"Testing {queryType} with EnableMultipleCatalogSupport={shouldAllowMultipleCatalogs}, CatalogName={catalogName}");
+
+            var statement = connection.CreateStatement();
+            statement.SetOption(ApacheParameters.IsMetadataCommand, "true");
+            statement.SetOption(ApacheParameters.CatalogName, catalogName);
+            // Use default as schema name, it is the default schema name
+            statement.SetOption(ApacheParameters.SchemaName, "default");
+            statement.SqlQuery = queryType;
+
+            QueryResult queryResult = await statement.ExecuteQueryAsync();
+            Assert.NotNull(queryResult.Stream);
+
+            // Store SPARK catalog schema for comparison
+            if (catalogName.Equals("SPARK", StringComparison.OrdinalIgnoreCase))
+            {
+                sparkSchemas[queryType] = queryResult.Stream.Schema;
+            }
+            // When EnableMultipleCatalogSupport is false and catalog is not SPARK, compare with SPARK schema
+            else if (!shouldAllowMultipleCatalogs)
+            {
+                var currentSchema = queryResult.Stream.Schema;
+                var sparkSchema = sparkSchemas[queryType];
+
+                // Compare field counts
+                Assert.True(sparkSchema.FieldsList.Count == currentSchema.FieldsList.Count,
+                    $"{queryType}: Schema field count mismatch between SPARK and {catalogName} catalogs");
+
+                // Compare each field
+                for (int i = 0; i < sparkSchema.FieldsList.Count; i++)
+                {
+                    var sparkField = sparkSchema.FieldsList[i];
+                    var currentField = currentSchema.FieldsList[i];
+
+                    Assert.True(sparkField.Name == currentField.Name,
+                        $"{queryType}: Field name mismatch at index {i} between SPARK and {catalogName} catalogs");
+                    Assert.True(sparkField.DataType.Equals(currentField.DataType),
+                        $"{queryType}: Field type mismatch at index {i} between SPARK and {catalogName} catalogs");
+                    Assert.True(sparkField.IsNullable == currentField.IsNullable,
+                        $"{queryType}: Field nullability mismatch at index {i} between SPARK and {catalogName} catalogs");
+                }
+
+                OutputHelper?.WriteLine($"Verified schema for {queryType} matches SPARK catalog schema");
+            }
+
+            int rowCount = 0;
+            HashSet<string> foundCatalogs = new HashSet<string>();
+            string? defaultCatalog = null;
+
+            while (queryResult.Stream != null)
+            {
+                RecordBatch? batch = await queryResult.Stream.ReadNextRecordBatchAsync();
+                if (batch == null) break;
+
+                rowCount += batch.Length;
+
+                // Check catalog values in each row
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    for (int j = 0; j < batch.ColumnCount; j++)
+                    {
+                        if (queryResult.Stream.Schema.FieldsList[j].Name.Equals("TABLE_CATALOG", StringComparison.OrdinalIgnoreCase) ||
+                            queryResult.Stream.Schema.FieldsList[j].Name.Equals("TABLE_CAT", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string? catalog = GetStringValue(batch.Column(j), i);
+                            if (!string.IsNullOrEmpty(catalog))
+                            {
+                                foundCatalogs.Add(catalog);
+                                // Store the first catalog we find as the default catalog
+                                defaultCatalog ??= catalog;
+                            }
+                        }
+                    }
+                }
+            }
+
+            OutputHelper?.WriteLine($"{queryType} returned {rowCount} rows, found {foundCatalogs.Count} different catalogs: {string.Join(", ", foundCatalogs)}");
+
+            // Special handling for GetCatalogs
+            if (queryType == "GetCatalogs")
+            {
+                if (!shouldAllowMultipleCatalogs)
+                {
+                    // When EnableMultipleCatalogSupport is false, should return just "SPARK"
+                    Assert.Equal(1, rowCount);
+                    Assert.Single(foundCatalogs);
+                    Assert.Contains("SPARK", foundCatalogs);
+                    OutputHelper?.WriteLine("Verified that only the synthetic SPARK catalog was returned when EnableMultipleCatalogSupport is false");
+                }
+                else
+                {
+                    // When EnableMultipleCatalogSupport is true, should return actual catalogs
+                    Assert.True(rowCount >= 1, "GetCatalogs should return at least one catalog");
+                    Assert.DoesNotContain("SPARK", foundCatalogs);
+                    OutputHelper?.WriteLine("Verified that actual catalogs were returned when EnableMultipleCatalogSupport is true");
+                }
+                return;
+            }
+
+            // For other metadata queries
+            if (!shouldAllowMultipleCatalogs)
+            {
+                if (catalogName.Equals("SPARK", StringComparison.OrdinalIgnoreCase))
+                {
+                    // When EnableMultipleCatalogSupport is false and catalog is SPARK, results should be from default catalog
+                    Assert.True(foundCatalogs.Count == 1,
+                        $"{queryType} should only return results from the default catalog when EnableMultipleCatalogSupport is false and catalog is SPARK");
+                    OutputHelper?.WriteLine($"All results are from default catalog: {defaultCatalog}");
+                }
+                else
+                {
+                    // When EnableMultipleCatalogSupport is false and catalog is not SPARK, should return empty result
+                    Assert.Equal(0, rowCount);
+                    Assert.Empty(foundCatalogs);
+                    OutputHelper?.WriteLine($"Verified empty result when EnableMultipleCatalogSupport is false and catalog is not SPARK");
+                }
+            }
+            else
+            {
+                // When EnableMultipleCatalogSupport is true
+                if (catalogName.Equals("SPARK", StringComparison.OrdinalIgnoreCase))
+                {
+                    // When catalog is SPARK, we may have results from multiple catalogs
+                    Assert.True(foundCatalogs.Count > 1,
+                        $"{queryType} should return results from multiple catalogs when EnableMultipleCatalogSupport is true and catalog is SPARK");
+                    OutputHelper?.WriteLine($"Found results from multiple catalogs: {string.Join(", ", foundCatalogs)}");
+                }
+                else
+                {
+                    // When catalog is not SPARK, we should only get results from that specific catalog
+                    Assert.True(foundCatalogs.Count == 1,
+                        $"{queryType} should return results from only the specified catalog when EnableMultipleCatalogSupport is true and catalog is not SPARK");
+                    Assert.Contains(catalogName, foundCatalogs);
+                    OutputHelper?.WriteLine($"Found results from catalog: {string.Join(", ", foundCatalogs)}");
+                }
+            }
+        }
+
+        private void AssertField(Schema schema, int index, string expectedName, IArrowType expectedType, bool expectedNullable)
+        {
+            var field = schema.FieldsList[index];
+            Assert.True(expectedName.Equals(field.Name), $"Field {index} name mismatch");
+            Assert.True(expectedType.Equals(field.DataType), $"Field {index} type mismatch");
+            Assert.True(expectedNullable == field.IsNullable, $"Field {index} nullability mismatch");
+        }
+
+        [Theory]
+        [InlineData(false, "main", true)]
+        [InlineData(true, null, true)]
+        [InlineData(true, "", true)]
+        [InlineData(true, "SPARK", true)]
+        [InlineData(true, "hive_metastore", true)]
+        [InlineData(true, "main", false)]
+        public void ShouldReturnEmptyPkFkResult_WorksAsExpected(bool enablePKFK, string? catalogName, bool expected)
+        {
+            // Arrange: create test configuration and connection
+            var testConfig = (DatabricksTestConfiguration)TestConfiguration.Clone();
+            var connectionParams = new Dictionary<string, string>
+            {
+                [DatabricksParameters.EnablePKFK] = enablePKFK.ToString().ToLowerInvariant()
+            };
+            using var connection = NewConnection(testConfig, connectionParams);
+            var statement = connection.CreateStatement();
+
+            // Set CatalogName using SetOption
+            if(catalogName != null)
+            {
+                statement.SetOption(ApacheParameters.CatalogName, catalogName);
+            }
+
+            // Act
+            var result = ((DatabricksStatement)statement).ShouldReturnEmptyPkFkResult();
+
+            // Assert
+            Assert.Equal(expected, result);
+        }
+
+        [SkippableFact]
+        public async Task PKFK_EmptyResult_SchemaMatches_RealMetadataResponse()
+        {
+            // Arrange: create test configuration and connection
+            var testConfig = (DatabricksTestConfiguration)TestConfiguration.Clone();
+            var connectionParams = new Dictionary<string, string>
+            {
+                [DatabricksParameters.EnablePKFK] = "true"
+            };
+            using var connection = NewConnection(testConfig, connectionParams);
+            var statement = connection.CreateStatement();
+
+            // Get real PK metadata schema
+            statement.SetOption(ApacheParameters.IsMetadataCommand, "true");
+            statement.SetOption(ApacheParameters.CatalogName, "powerbi");
+            statement.SetOption(ApacheParameters.SchemaName, TestConfiguration.Metadata.Schema);
+            statement.SetOption(ApacheParameters.TableName, TestConfiguration.Metadata.Table);
+            statement.SqlQuery = "GetPrimaryKeys";
+            var realPkResult = await statement.ExecuteQueryAsync();
+            Assert.NotNull(realPkResult.Stream);
+            var realPkSchema = realPkResult.Stream.Schema;
+
+            // Get empty PK result schema (using SPARK catalog which should return empty)
+            statement.SetOption(ApacheParameters.CatalogName, "SPARK");
+            var emptyPkResult = await statement.ExecuteQueryAsync();
+            Assert.NotNull(emptyPkResult.Stream);
+            var emptyPkSchema = emptyPkResult.Stream.Schema;
+
+            // Verify PK schemas match
+            Assert.Equal(realPkSchema.FieldsList.Count, emptyPkSchema.FieldsList.Count);
+            for (int i = 0; i < realPkSchema.FieldsList.Count; i++)
+            {
+                var realField = realPkSchema.FieldsList[i];
+                var emptyField = emptyPkSchema.FieldsList[i];
+                AssertField(emptyField, realField.Name, realField.DataType, realField.IsNullable);
+            }
+
+            // Get real FK metadata schema
+            statement.SetOption(ApacheParameters.CatalogName, TestConfiguration.Metadata.Catalog);
+            statement.SqlQuery = "GetCrossReference";
+            var realFkResult = await statement.ExecuteQueryAsync();
+            Assert.NotNull(realFkResult.Stream);
+            var realFkSchema = realFkResult.Stream.Schema;
+
+            // Get empty FK result schema
+            statement.SetOption(ApacheParameters.CatalogName, "SPARK");
+            var emptyFkResult = await statement.ExecuteQueryAsync();
+            Assert.NotNull(emptyFkResult.Stream);
+            var emptyFkSchema = emptyFkResult.Stream.Schema;
+
+            // Verify FK schemas match
+            Assert.Equal(realFkSchema.FieldsList.Count, emptyFkSchema.FieldsList.Count);
+            for (int i = 0; i < realFkSchema.FieldsList.Count; i++)
+            {
+                var realField = realFkSchema.FieldsList[i];
+                var emptyField = emptyFkSchema.FieldsList[i];
+                AssertField(emptyField, realField.Name, realField.DataType, realField.IsNullable);
+            }
+        }
+
+        private void AssertField(Field field, string expectedName, IArrowType expectedType, bool expectedNullable)
+        {
+            Assert.True(expectedName.Equals(field.Name), $"Field name mismatch: expected {expectedName}, got {field.Name}");
+            Assert.True(expectedType.Equals(field.DataType), $"Field type mismatch: expected {expectedType}, got {field.DataType}");
+            Assert.True(expectedNullable == field.IsNullable, $"Field nullability mismatch: expected {expectedNullable}, got {field.IsNullable}");
         }
     }
 }
