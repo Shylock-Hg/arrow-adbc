@@ -15,14 +15,18 @@
 * limitations under the License.
 */
 
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Net;
+using Apache.Arrow.Adbc;
 using Apache.Arrow.Adbc.Drivers.Apache;
 using Apache.Arrow.Adbc.Drivers.Apache.Hive2;
 using Apache.Arrow.Adbc.Drivers.Apache.Spark;
 using Apache.Arrow.Adbc.Drivers.Databricks;
+using Apache.Hive.Service.Rpc.Thrift;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Net;
+using System.Reflection;
+using System.Threading.Tasks;
 using Thrift.Transport;
 using Xunit;
 using Xunit.Abstractions;
@@ -313,7 +317,91 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Databricks
                 Add(new(new() { [SparkParameters.Type] = SparkServerTypeConstants.Http, [SparkParameters.HostName] = "valid.server.com", [AdbcOptions.Username] = "user", [AdbcOptions.Password] = "myPassword", [DatabricksParameters.TemporarilyUnavailableRetry] = "invalid" }, typeof(ArgumentOutOfRangeException)));
                 Add(new(new() { [SparkParameters.Type] = SparkServerTypeConstants.Http, [SparkParameters.HostName] = "valid.server.com", [AdbcOptions.Username] = "user", [AdbcOptions.Password] = "myPassword", [DatabricksParameters.TemporarilyUnavailableRetryTimeout] = "invalid" }, typeof(ArgumentOutOfRangeException)));
                 Add(new(new() { [SparkParameters.Type] = SparkServerTypeConstants.Http, [SparkParameters.HostName] = "valid.server.com", [AdbcOptions.Username] = "user", [AdbcOptions.Password] = "myPassword", [DatabricksParameters.TemporarilyUnavailableRetryTimeout] = "-1" }, typeof(ArgumentOutOfRangeException)));
+
+                // Tests for EnableMultipleCatalogSupport parameter
+                Add(new(new() { [SparkParameters.Type] = SparkServerTypeConstants.Http, [SparkParameters.HostName] = "valid.server.com", [AdbcOptions.Username] = "user", [AdbcOptions.Password] = "myPassword", [DatabricksParameters.EnableMultipleCatalogSupport] = "notabool" }, typeof(ArgumentException)));
             }
+        }
+
+        /// <summary>
+        /// Tests that default namespace is correctly stored in the connection namespace.
+        /// </summary>
+        [SkippableFact]
+        internal void DefaultNamespaceStoredInConnection()
+        {
+            // Skip if default catalog or schema is not configured
+            Skip.If(string.IsNullOrEmpty(TestConfiguration.Catalog), "Default catalog not configured");
+            Skip.If(string.IsNullOrEmpty(TestConfiguration.DbSchema), "Default schema not configured");
+
+            // Act
+            using var connection = NewConnection();
+
+            // Assert
+            Assert.NotNull(connection);
+            Assert.IsType<DatabricksConnection>(connection);
+
+            var defaultNamespace = ((DatabricksConnection)connection).DefaultNamespace;
+            Assert.NotNull(defaultNamespace);
+            Assert.Equal(TestConfiguration.Catalog, defaultNamespace.CatalogName);
+            Assert.Equal(TestConfiguration.DbSchema, defaultNamespace.SchemaName);
+        }
+
+        // Test that the catalog and schema are set correctly in the dbr session and the statement
+        // note - this test assumes not legacy dbr and hive_metastore is the default catalog
+        // also assumes there is a main catalog and hive_metastore.information_schema schema
+        [SkippableTheory]
+        [InlineData(null, null, "true", "hive_metastore", "default")]
+        [InlineData("main", null, "true", "main", "default")]
+        [InlineData(null, "information_schema", "true", "hive_metastore", "information_schema")]
+        [InlineData("main", "information_schema", "true", "main", "information_schema")]
+        [InlineData("SPARK", null, "true", "hive_metastore", "default")]
+        [InlineData("SPARK", "information_schema", "true", "hive_metastore", "information_schema")]
+        [InlineData(null, null, "false", null, "default")]
+        [InlineData("main", null, "false", null, "default")]
+        [InlineData(null, "information_schema", "false", null, "information_schema")]
+        [InlineData("main", "information_schema", "false", null, "information_schema")]
+        [InlineData("SPARK", null, "false", null, "default")]
+        [InlineData("SPARK", "information_schema", "false", null, "information_schema")]
+        public async Task SetDefaultCatalogAndSchemaOptionsTest(string? inputCatalog, string? inputSchema, string enableMultipleCatalogSupport, string? expectedCatalogInStatement, string? expectedRuntimeSchema)
+        {
+            // Arrange
+            var testConfig = (DatabricksTestConfiguration)TestConfiguration.Clone();
+            testConfig.EnableMultipleCatalogSupport = enableMultipleCatalogSupport;
+
+            if (inputCatalog is not null) testConfig.Catalog = inputCatalog;
+            if (inputSchema is not null) testConfig.DbSchema = inputSchema;
+
+            var connection = NewConnection(testConfig);
+            var statement = connection.CreateStatement();
+            statement.SqlQuery = "SELECT current_catalog(), current_schema()";
+
+            // Act
+            var result = await statement.ExecuteQueryAsync();
+            Assert.NotNull(result);
+            Assert.NotNull(result.Stream);
+            var batch = await result.Stream.ReadNextRecordBatchAsync();
+
+            Assert.NotNull(batch);
+            Assert.Equal(1, batch.Length);
+            Assert.Equal(2, batch.ColumnCount);
+
+            var catalogFromRuntime = ((StringArray)batch.Column(0)).GetString(0);
+            var schemaFromRuntime = ((StringArray)batch.Column(1)).GetString(0);
+
+            // Assert runtime results
+            // if !enableMultipleCatalogSupport, then the runtime catalog should be hive_metastore
+            var expectedRuntimeCatalog = enableMultipleCatalogSupport == "true" ? expectedCatalogInStatement : "hive_metastore";
+            Assert.Equal(expectedRuntimeCatalog, catalogFromRuntime);
+            Assert.Equal(expectedRuntimeSchema, schemaFromRuntime);
+
+            // Assert statement object values
+            var dbStatement = (DatabricksStatement)statement;
+            Assert.Equal(expectedCatalogInStatement, dbStatement.CatalogName);
+            Assert.Null(dbStatement.SchemaName); // Always null, to be consistent with odbc
+
+            OutputHelper?.WriteLine(
+                $"Test passed for inputCatalog={inputCatalog}, inputSchema={inputSchema}, enableMultipleCatalogSupport={enableMultipleCatalogSupport}. " +
+                $"Runtime catalog={catalogFromRuntime}, schema={schemaFromRuntime}, Statement catalog={dbStatement.CatalogName}");
         }
     }
 }
