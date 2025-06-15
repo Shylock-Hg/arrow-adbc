@@ -34,6 +34,7 @@ It currently provides:
 
 To run the integration tests you must:
 
+1. Install a recent version of [protobuf](https://github.com/protocolbuffers/protobuf) and have its `bin` (`protoc`) in path.
 1. Install [SQLite](https://www.sqlite.org/) and have its dynamic library in path.
 1. Build the official ADBC SQLite driver by following the [documentation](../CONTRIBUTING.md).
 1. Place the resulting object file into your dynamic loader path or set
@@ -48,4 +49,4 @@ To write an ADBC driver in Rust you have to:
 1. Implement the abstract API which consists of the traits `Driver`, `Database`, `Connection` and `Statement`.
 1. Export your driver to C with the macro `adbc_core::export_driver!`.
 
-The resulting object file can then be loaded by other languages trough their own driver manager.
+The resulting object file can then be loaded by other languages through their own driver manager.

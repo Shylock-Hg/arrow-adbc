@@ -24,11 +24,14 @@ using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using Apache.Arrow.Adbc.Drivers.Apache;
+using Apache.Arrow.Adbc.Drivers.Apache.Hive2;
+using Apache.Arrow.Adbc.Drivers.Apache.Hive2.Client;
 using Apache.Arrow.Adbc.Drivers.Apache.Spark;
 using Apache.Arrow.Adbc.Drivers.Databricks.Auth;
 using Apache.Arrow.Adbc.Drivers.Databricks.CloudFetch;
 using Apache.Arrow.Ipc;
 using Apache.Hive.Service.Rpc.Thrift;
+using Thrift.Protocol;
 
 namespace Apache.Arrow.Adbc.Drivers.Databricks
 {
@@ -36,6 +39,8 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
     {
         private bool _applySSPWithQueries = false;
         private bool _enableDirectResults = true;
+        private bool _enableMultipleCatalogSupport = true;
+        private bool _enablePKFK = true;
 
         internal static TSparkGetDirectResults defaultGetDirectResults = new()
         {
@@ -50,15 +55,47 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
         private bool _canDecompressLz4 = true;
         private long _maxBytesPerFile = DefaultMaxBytesPerFile;
         private const bool DefaultRetryOnUnavailable= true;
-        private const int DefaultTemporarilyUnavailableRetryTimeout = 500;
+        private const int DefaultTemporarilyUnavailableRetryTimeout = 900;
+
+        // Default namespace
+        private TNamespace? _defaultNamespace;
 
         public DatabricksConnection(IReadOnlyDictionary<string, string> properties) : base(properties)
         {
             ValidateProperties();
         }
 
+        protected override TCLIService.IAsync CreateTCLIServiceClient(TProtocol protocol)
+        {
+            return new ThreadSafeClient(new TCLIService.Client(protocol));
+        }
+
         private void ValidateProperties()
         {
+            if (Properties.TryGetValue(DatabricksParameters.EnablePKFK, out string? enablePKFKStr))
+            {
+                if (bool.TryParse(enablePKFKStr, out bool enablePKFKValue))
+                {
+                    _enablePKFK = enablePKFKValue;
+                }
+                else
+                {
+                    throw new ArgumentException($"Parameter '{DatabricksParameters.EnablePKFK}' value '{enablePKFKStr}' could not be parsed. Valid values are 'true', 'false'.");
+                }
+            }
+
+            if (Properties.TryGetValue(DatabricksParameters.EnableMultipleCatalogSupport, out string? enableMultipleCatalogSupportStr))
+            {
+                if (bool.TryParse(enableMultipleCatalogSupportStr, out bool enableMultipleCatalogSupportValue))
+                {
+                    _enableMultipleCatalogSupport = enableMultipleCatalogSupportValue;
+                }
+                else
+                {
+                    throw new ArgumentException($"Parameter '{DatabricksParameters.EnableMultipleCatalogSupport}' value '{enableMultipleCatalogSupportStr}' could not be parsed. Valid values are 'true', 'false'.");
+                }
+            }
+
             if (Properties.TryGetValue(DatabricksParameters.ApplySSPWithQueries, out string? applySSPWithQueriesStr))
             {
                 if (bool.TryParse(applySSPWithQueriesStr, out bool applySSPWithQueriesValue))
@@ -124,6 +161,30 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
                 }
                 _maxBytesPerFile = maxBytesPerFileValue;
             }
+
+            // Parse default namespace
+            string? defaultCatalog = null;
+            string? defaultSchema = null;
+            // only if enableMultipleCatalogSupport is true, do we supply catalog from connection properties
+            if (_enableMultipleCatalogSupport)
+            {
+                Properties.TryGetValue(AdbcOptions.Connection.CurrentCatalog, out defaultCatalog);
+            }
+            Properties.TryGetValue(AdbcOptions.Connection.CurrentDbSchema, out defaultSchema);
+
+            // This maintains backward compatibility with older workspaces, where the Hive metastore was accessed via the spark catalog name.
+            // In newer DBR versions with Unity Catalog, the default catalog is typically hive_metastore.
+            // Passing null here allows the runtime to fall back to the workspace-defined default catalog for the session.
+            defaultCatalog = HandleSparkCatalog(defaultCatalog);
+
+            if (!string.IsNullOrWhiteSpace(defaultCatalog) || !string.IsNullOrWhiteSpace(defaultSchema))
+            {
+                _defaultNamespace = new TNamespace
+                {
+                    CatalogName = defaultCatalog,
+                    SchemaName = defaultSchema
+                };
+            }
         }
 
         /// <summary>
@@ -150,6 +211,21 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
         /// Gets the maximum bytes per file for CloudFetch.
         /// </summary>
         internal long MaxBytesPerFile => _maxBytesPerFile;
+
+        /// <summary>
+        /// Gets the default namespace to use for SQL queries.
+        /// </summary>
+        internal TNamespace? DefaultNamespace => _defaultNamespace;
+
+        /// <summary>
+        /// Gets whether multiple catalog is supported
+        /// </summary>
+        internal bool EnableMultipleCatalogSupport => _enableMultipleCatalogSupport;
+
+        /// <summary>
+        /// Gets whether PK/FK metadata call is enabled
+        /// </summary>
+        public bool EnablePKFK => _enablePKFK;
 
         /// <summary>
         /// Gets a value indicating whether to retry requests that receive a 503 response with a Retry-After header.
@@ -194,11 +270,16 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
 
                 Properties.TryGetValue(DatabricksParameters.OAuthClientId, out string? clientId);
                 Properties.TryGetValue(DatabricksParameters.OAuthClientSecret, out string? clientSecret);
+                Properties.TryGetValue(DatabricksParameters.OAuthScope, out string? scope);
+
+                HttpClient OauthHttpClient = new HttpClient(HiveServer2TlsImpl.NewHttpClientHandler(TlsOptions, _proxyConfigurator));
 
                 var tokenProvider = new OAuthClientCredentialsProvider(
+                    OauthHttpClient,
                     clientId!,
                     clientSecret!,
                     host!,
+                    scope: scope ?? "sql",
                     timeoutMinutes: 1
                 );
 
@@ -253,7 +334,8 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
             // Choose the appropriate reader based on the result format
             if (resultFormat == TSparkRowSetType.URL_BASED_SET)
             {
-                return new CloudFetchReader(databricksStatement, schema, isLz4Compressed);
+                HttpClient cloudFetchHttpClient = new HttpClient(HiveServer2TlsImpl.NewHttpClientHandler(TlsOptions, _proxyConfigurator));
+                return new CloudFetchReader(databricksStatement, schema, isLz4Compressed, cloudFetchHttpClient);
             }
             else
             {
@@ -275,8 +357,14 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
             {
                 Client_protocol = TProtocolVersion.SPARK_CLI_SERVICE_PROTOCOL_V7,
                 Client_protocol_i64 = (long)TProtocolVersion.SPARK_CLI_SERVICE_PROTOCOL_V7,
-                CanUseMultipleCatalogs = true,
+                CanUseMultipleCatalogs = _enableMultipleCatalogSupport,
             };
+
+            // Set default namespace if available
+            if (_defaultNamespace != null)
+            {
+                req.InitialNamespace = _defaultNamespace;
+            }
 
             // If not using queries to set server-side properties, include them in Configuration
             if (!_applySSPWithQueries)
@@ -291,6 +379,34 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
             return req;
         }
 
+        protected override async Task HandleOpenSessionResponse(TOpenSessionResp? session)
+        {
+            await base.HandleOpenSessionResponse(session);
+            if (session != null)
+            {
+                _enableMultipleCatalogSupport = session.__isset.canUseMultipleCatalogs ? session.CanUseMultipleCatalogs : false;
+                if (session.__isset.initialNamespace)
+                {
+                    _defaultNamespace = session.InitialNamespace;
+                }
+                else if (_defaultNamespace != null && !string.IsNullOrEmpty(_defaultNamespace.SchemaName))
+                {
+                    // server version is too old. Explicitly set the schema using queries
+                    await SetSchema(_defaultNamespace.SchemaName);
+                }
+                // catalog in namespace is introduced when SET CATALOG is introduced, so we don't need to fallback
+            }
+        }
+
+        // Since Databricks Namespace was introduced in newer versions, we fallback to USE SCHEMA to set default schema
+        // in case the server version is too low.
+        private async Task SetSchema(string schemaName)
+        {
+            using var statement = new DatabricksStatement(this);
+            statement.SqlQuery = $"USE {schemaName}";
+            await statement.ExecuteUpdateAsync();
+        }
+
         /// <summary>
         /// Gets a dictionary of server-side properties extracted from connection properties.
         /// </summary>
@@ -298,7 +414,7 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
         private Dictionary<string, string> GetServerSideProperties()
         {
             return Properties
-                .Where(p => p.Key.StartsWith(DatabricksParameters.ServerSidePropertyPrefix))
+                .Where(p => p.Key.ToLowerInvariant().StartsWith(DatabricksParameters.ServerSidePropertyPrefix))
                 .ToDictionary(
                     p => p.Key.Substring(DatabricksParameters.ServerSidePropertyPrefix.Length),
                     p => p.Value
@@ -363,7 +479,7 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
 
         protected override void ValidateOptions()
         {
-             base.ValidateOptions();
+            base.ValidateOptions();
 
             if (Properties.TryGetValue(DatabricksParameters.TemporarilyUnavailableRetry, out string? tempUnavailableRetryStr))
             {
@@ -466,6 +582,15 @@ namespace Apache.Arrow.Adbc.Drivers.Databricks
                 // For other auth flows, use default OAuth validation
                 base.ValidateOAuthParameters();
             }
+        }
+
+        internal static string? HandleSparkCatalog(string? CatalogName)
+        {
+            if (CatalogName != null && CatalogName.Equals("SPARK", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            return CatalogName;
         }
     }
 }
