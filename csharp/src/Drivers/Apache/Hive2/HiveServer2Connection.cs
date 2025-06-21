@@ -41,7 +41,7 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
         internal const int PollTimeMillisecondsDefault = 500;
         private const int ConnectTimeoutMillisecondsDefault = 30000;
         private TTransport? _transport;
-        private TCLIService.Client? _client;
+        private TCLIService.IAsync? _client;
         private readonly Lazy<string> _vendorVersion;
         private readonly Lazy<string> _vendorName;
 
@@ -287,7 +287,7 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
             }
         }
 
-        internal TCLIService.Client Client
+        internal TCLIService.IAsync Client
         {
             get { return _client ?? throw new InvalidOperationException("connection not open"); }
         }
@@ -308,24 +308,11 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
                 TTransport transport = CreateTransport();
                 TProtocol protocol = await CreateProtocolAsync(transport, cancellationToken);
                 _transport = protocol.Transport;
-                _client = new TCLIService.Client(protocol);
+                _client = CreateTCLIServiceClient(protocol);
                 TOpenSessionReq request = CreateSessionRequest();
 
                 TOpenSessionResp? session = await Client.OpenSession(request, cancellationToken);
-
-                // Explicitly check the session status
-                if (session == null)
-                {
-                    throw new HiveServer2Exception("Unable to open session. Unknown error.");
-                }
-                else if (session.Status.StatusCode != TStatusCode.SUCCESS_STATUS)
-                {
-                    throw new HiveServer2Exception(session.Status.ErrorMessage)
-                        .SetNativeError(session.Status.ErrorCode)
-                        .SetSqlState(session.Status.SqlState);
-                }
-
-                SessionHandle = session.SessionHandle;
+                await HandleOpenSessionResponse(session);
             }
             catch (Exception ex) when (ExceptionHelper.IsOperationCanceledOrCancellationRequested(ex, cancellationToken))
             {
@@ -334,11 +321,37 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
             catch (Exception ex) when (ex is not HiveServer2Exception)
             {
                 // Handle other exceptions if necessary
-                throw new HiveServer2Exception($"An unexpected error occurred while opening the session. '{ex.Message}'", ex);
+                throw new HiveServer2Exception($"An unexpected error occurred while opening the session. '{ApacheUtility.FormatExceptionMessage(ex)}'", ex);
             }
         }
 
+        protected virtual Task HandleOpenSessionResponse(TOpenSessionResp? session)
+        {
+            // Explicitly check the session status
+            if (session == null)
+            {
+                throw new HiveServer2Exception("Unable to open session. Unknown error.");
+            }
+            else if (session.Status.StatusCode != TStatusCode.SUCCESS_STATUS)
+            {
+                throw new HiveServer2Exception(session.Status.ErrorMessage)
+                    .SetNativeError(session.Status.ErrorCode)
+                    .SetSqlState(session.Status.SqlState);
+            }
+
+            SessionHandle = session.SessionHandle;
+            ServerProtocolVersion = session.ServerProtocolVersion;
+            return Task.CompletedTask;
+        }
+
+        protected virtual TCLIService.IAsync CreateTCLIServiceClient(TProtocol protocol)
+        {
+            return new TCLIService.Client(protocol);
+        }
+
         internal TSessionHandle? SessionHandle { get; private set; }
+
+        internal TProtocolVersion? ServerProtocolVersion { get; private set; }
 
         protected internal DataTypeConversion DataTypeConversion { get; set; } = DataTypeConversion.None;
 
@@ -583,7 +596,7 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
             }
             catch (Exception ex) when (ex is not HiveServer2Exception)
             {
-                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ex.Message}'", ex);
+                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ApacheUtility.FormatExceptionMessage(ex)}'", ex);
             }
         }
 
@@ -632,7 +645,7 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
             }
             catch (Exception ex) when (ex is not HiveServer2Exception)
             {
-                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ex.Message}'", ex);
+                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ApacheUtility.FormatExceptionMessage(ex)}'", ex);
             }
         }
 
@@ -684,7 +697,7 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
             }
             catch (Exception ex) when (ex is not HiveServer2Exception)
             {
-                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ex.Message}'", ex);
+                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ApacheUtility.FormatExceptionMessage(ex)}'", ex);
             }
         }
 
@@ -696,7 +709,10 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
                 TCloseSessionReq r6 = new(SessionHandle);
                 _client.CloseSession(r6, cancellationToken).Wait();
                 _transport?.Close();
-                _client.Dispose();
+                if (_client is IDisposable disposableClient)
+                {
+                    disposableClient.Dispose();
+                }
                 _transport = null;
                 _client = null;
             }
@@ -1295,7 +1311,7 @@ namespace Apache.Arrow.Adbc.Drivers.Apache.Hive2
             }
             catch (Exception ex) when (ex is not HiveServer2Exception)
             {
-                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ex.Message}'", ex);
+                throw new HiveServer2Exception($"An unexpected error occurred while running metadata query. '{ApacheUtility.FormatExceptionMessage(ex)}'", ex);
             }
         }
 
