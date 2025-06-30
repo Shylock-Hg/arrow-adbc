@@ -60,8 +60,7 @@ Installation
 
       .. code-block:: shell
 
-         # install.packages("pak")
-         pak::pak("apache/arrow-adbc/r/adbcsnowflake")
+         install.packages("adbcsnowflake", repos = "https://community.r-multiverse.org")
 
 Usage
 =====
@@ -145,6 +144,14 @@ The Snowflake URI should be of one of the following formats:
 - ``user[:password]@account/database[?param1=value1&paramN=valueN]``
 - ``user[:password]@host:port/database/schema?account=user_account[&param1=value1&paramN=valueN]``
 - ``host:port/database/schema?account=user_account[&param1=value1&paramN=valueN]``
+
+Refer to the official
+`Snowflake documentation <https://docs.snowflake.com/en/user-guide/gen-conn-config>`_
+to obtain a valid connection URI or to the
+`Snowflake Go driver documentation <https://pkg.go.dev/github.com/snowflakedb/gosnowflake#hdr-Connection_String>`_
+to build a URI manually.
+Notice that from the Snowflake context, arrow-adbc is considered the Snowflake Go driver since
+that implementation is used under the hood.
 
 Alternately, instead of providing a full URI, the configuration can
 be entirely supplied using the other available options or some combination
@@ -291,7 +298,7 @@ and resource usage may be tuned with the following options on the :c:struct:`Adb
 
 ``adbc.snowflake.statement.ingest_upload_concurrency``
     Number of Parquet files to upload in parallel. Greater concurrency can smooth out TCP congestion and help make
-    use of available network bandwith, but will increase memory utilization. Default is 8. If set to 0, default value is used.
+    use of available network bandwidth, but will increase memory utilization. Default is 8. If set to 0, default value is used.
     Cannot be negative.
 
 ``adbc.snowflake.statement.ingest_copy_concurrency``
@@ -469,6 +476,14 @@ These options map 1:1 with the Snowflake `Config object <https://pkg.go.dev/gith
     non-zero scaled columns will be returned as ``Float64`` typed Arrow columns.
     The default is ``true``.
 
+``adbc.snowflake.sql.client_option.max_timestamp_precision``
+    Controls the behavior of Timestamp values with Nanosecond precision. Native Go behavior
+    is these values will overflow to an unpredictable value when the year is before year 1677 or after 2262.
+    This option can control the behavior of the `timestamp_ltz`, `timestamp_ntz`, and `timestamp_tz` types.
+    Valid values are
+    - ``nanoseconds``: Use default behavior for nanoseconds.
+    - ``nanoseconds_error_on_overflow``: Throws an error when the value will overflow to enforce integrity of the data.
+    - ``microseconds``: Limits the max Timestamp precision to microseconds, which is safe for all values.
 
 Metadata
 --------

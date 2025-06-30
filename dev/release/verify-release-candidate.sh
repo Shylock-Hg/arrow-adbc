@@ -19,7 +19,7 @@
 #
 
 # Requirements
-# - Ruby >= 2.3
+# - Ruby >= 3.2
 # - Maven >= 3.3.9
 # - JDK >= 11
 # - gcc >= 4.8
@@ -273,9 +273,12 @@ install_dotnet() {
   local dotnet_download_thank_you_url=https://dotnet.microsoft.com/download/thank-you/dotnet-sdk-${dotnet_version}-${dotnet_platform}-x64-binaries
   show_info "Getting .NET download URL from ${dotnet_download_thank_you_url}"
   local dotnet_download_url=$(curl -sL ${dotnet_download_thank_you_url} | \
-                                  grep 'directLink' | \
-                                  grep -E -o 'https://download[^"]+' | \
-                                  sed -n 2p)
+                                  grep 'recordManualDownload' | \
+                                  grep -E -o 'https://builds.dotnet[^"]+')
+  if [ -z "${dotnet_download_url}" ]; then
+    echo "Failed to get .NET download URL from ${dotnet_download_thank_you_url}"
+    exit 1
+  fi
   show_info "Downloading .NET from ${dotnet_download_url}"
   mkdir -p ${csharp_bin}
   curl -sL ${dotnet_download_url} | \
@@ -947,7 +950,7 @@ test_jars() {
 # Automatically test if its activated by a dependent
 TEST_CPP=$((${TEST_CPP} + ${TEST_GO} + ${TEST_GLIB} + ${TEST_PYTHON} + ${TEST_RUST}))
 
-# Execute tests in a conda enviroment
+# Execute tests in a conda environment
 : ${USE_CONDA:=0}
 
 TEST_SUCCESS=no
