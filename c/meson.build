@@ -38,6 +38,7 @@ add_project_arguments(
 add_project_arguments('-Wno-unused-parameter', '-Wno-reorder', language: 'cpp')
 
 c_dir = include_directories('.')
+vendor_dir = include_directories('vendor')
 include_dir = include_directories('include')
 install_headers('include/adbc.h')
 install_headers('include/arrow-adbc/adbc.h', subdir: 'arrow-adbc')
@@ -69,10 +70,7 @@ endif
 
 subdir('driver/common')
 subdir('driver/framework')
-
-if get_option('tests').enabled()
-    subdir('validation')
-endif
+subdir('validation')
 
 if get_option('bigquery').enabled()
     subdir('driver/bigquery')
