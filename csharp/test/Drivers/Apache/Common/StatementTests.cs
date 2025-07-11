@@ -284,7 +284,8 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Apache.Common
             QueryResult queryResult = await statement.ExecuteQueryAsync();
             Assert.NotNull(queryResult.Stream);
 
-            Assert.Equal(23, queryResult.Stream.Schema.FieldsList.Count);
+            // 23 original metadata columns and one added for "base type"
+            Assert.Equal(24, queryResult.Stream.Schema.FieldsList.Count);
             int actualBatchLength = 0;
 
             while (queryResult.Stream != null)
@@ -497,7 +498,8 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Apache.Common
                 Assert.Equal(StringType.Default, queryResult.Stream.Schema.FieldsList[5].DataType); // FK_SCHEMA_NAME
                 Assert.Equal(StringType.Default, queryResult.Stream.Schema.FieldsList[6].DataType); // FK_TABLE_NAME
                 Assert.Equal(StringType.Default, queryResult.Stream.Schema.FieldsList[7].DataType); // FK_COLUMN_NAME
-                Assert.Equal(Int32Type.Default, queryResult.Stream.Schema.FieldsList[8].DataType); // FK_INDEX
+                // Databricks return Int16(SmallInt)
+                Assert.True(queryResult.Stream.Schema.FieldsList[8].DataType is Int32Type or Int16Type, "FK_INDEX should be either Int32 or Int16"); // FK_INDEX
                 Assert.Equal(expectedBatchLength, batch.Length);
                 actualBatchLength += batch.Length;
                 for (int i = 0; i < batch.Length; i++)
@@ -559,13 +561,13 @@ namespace Apache.Arrow.Adbc.Tests.Drivers.Apache.Common
     /// </summary>
     internal class ShortRunningStatementTimeoutTestData : TheoryData<StatementWithExceptions>
     {
-        public ShortRunningStatementTimeoutTestData()
+        public ShortRunningStatementTimeoutTestData(string? defaultQuery = null)
         {
-            Add(new(0, null, null));
-            Add(new(null, null, null));
-            Add(new(1, null, typeof(TimeoutException)));
-            Add(new(5, null, null));
-            Add(new(30, null, null));
+            Add(new(0, defaultQuery, null));
+            Add(new(null, defaultQuery, null));
+            Add(new(1, defaultQuery, typeof(TimeoutException)));
+            Add(new(5, defaultQuery, null));
+            Add(new(30, defaultQuery, null));
         }
     }
 }

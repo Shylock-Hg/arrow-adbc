@@ -19,7 +19,7 @@
 //!
 //! The driver manager provides an implementation of the ADBC interface which
 //! uses FFI to wrap an object file implementation of
-//! [`adbc.h`](https://github.com/apache/arrow-adbc/blob/main/adbc.h).
+//! [`adbc.h`](https://github.com/apache/arrow-adbc/blob/main/c/include/arrow-adbc/adbc.h).
 //!
 //! There are two ways that drivers can be used:
 //! 1. By linking (either statically or dynamically) the driver implementation
@@ -154,7 +154,7 @@ struct ManagedDriverInner {
     // The dynamic library must be kept loaded for the entire lifetime of the driver.
     // To avoid complex lifetimes we prefer to store it as part of this struct.
     // Besides, the `library` field must always appear after `driver` because of drop order:
-    // `driver` has an implicit dependency on `library` and so it must be droped
+    // `driver` has an implicit dependency on `library` and so it must be dropped
     // before `library` because otherwise `driver` would be full of dangling
     // function pointers.
     // See: https://doc.rust-lang.org/std/ops/trait.Drop.html#drop-order
